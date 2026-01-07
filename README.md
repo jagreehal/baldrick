@@ -26,7 +26,68 @@ chmod +x baldrick
 
 Each spec includes: context, scope boundaries, examples, BDD scenarios, diagrams, and done criteria.
 
-> **Note:** The gherkin syntax is for Claude to understand expected behavior—it's documentation, not executable Cucumber tests. Claude reads these scenarios and implements code + tests to match.
+> **Note:** The gherkin syntax is for Claude to understand expected behaviour—it's documentation, not executable Cucumber tests. Claude reads these scenarios and implements code + tests to match.
+
+### The loop (every iteration)
+
+1. Read specs (`passes: false` first), `progress.txt`, and logs
+2. Implement the next spec only
+3. Run build, tests, and lint (`BUILD_CMD`, `TEST_CMD`, `LINT_CMD`)
+4. Flip the spec to `passes: true` when it satisfies Done When
+5. Append evidence and learnings to `progress.txt`
+6. Commit your work (the prompt asks Claude to do this)
+7. Stop when all specs pass or `.baldrick-done` exists
+
+Pseudo-loop:
+
+```bash
+for ((i=1; i<=n; i++)); do
+  claude --permission-mode acceptEdits \
+    -p "@specs/*.md @progress.txt ... instructions"
+done
+```
+
+### Reviewer mode (every 5th iteration)
+
+Every 5th iteration, Claude switches from **Worker** to **Reviewer** mode:
+
+1. Check progress.txt — are we on track?
+2. Verify completed specs — do they actually work?
+3. Run tests to validate previous work
+4. Fix issues before moving on
+5. If stuck 2+ iterations, try a different approach
+
+This prevents broken code from compounding across iterations.
+
+### State and files
+
+- `specs/*.md` — feature specs with YAML frontmatter
+- `progress.txt` — session learnings (per-run context)
+- `baldrick-learnings.md` — permanent codebase patterns (survives across specs)
+- `logs/` — per-run logs
+- `docs/` — generated PR docs
+- `.baldrick-done` — file-based completion signal
+- `baldrick-features.json` — simple mode (JSON) if you use `./baldrick init`
+- `templates/` — spec templates shipped with the script
+
+After `./baldrick init spec`:
+
+```text
+specs/
+progress.txt
+logs/
+docs/
+templates/detailed/{feature.md, feature-detailed.md}
+```
+
+### Progress format (append in `progress.txt`)
+
+```markdown
+## 2025-01-07 - login
+- What was done: Implemented login happy path + errors
+- Test output: npm test (paste real output)
+- Next: Add rate limiting later
+```
 
 ### Example Spec
 
@@ -129,6 +190,48 @@ Claude reads this spec, implements exactly what's defined, then sets `passes: tr
 
 ---
 
+## Built-in Safeguards
+
+- Stuck detection: Warns after two unchanged iterations; nudges Claude to change approach.
+- Evidence required: Paste real build/test/lint output into `progress.txt`.
+- Completion signals: Either set all specs to `passes: true` or create `.baldrick-done`.
+- Single-spec focus: Each iteration works on one spec only to avoid thrash.
+
+---
+
+## Monitoring
+
+Quick commands to check progress:
+
+```bash
+# Spec status (requires jq)
+cat specs/*.md | grep -E "^(title|passes):" | paste - -
+
+# Recent commits
+git log --oneline -10
+
+# Learnings so far
+cat progress.txt | tail -50
+```
+
+---
+
+## Learnings Guidance
+
+**Add to `baldrick-learnings.md`:**
+
+- "When modifying X, also update Y"
+- "This module uses pattern Z"
+- "Tests require dev server running"
+
+**Don't add:**
+
+- Spec-specific details (goes in progress.txt)
+- Temporary notes
+- Info already documented elsewhere
+
+---
+
 ## Configuration
 
 Edit lines 23-25 in `baldrick` for your project:
@@ -149,6 +252,90 @@ BUILD_CMD="cargo build"
 TEST_CMD="cargo test"
 LINT_CMD="cargo clippy"
 ```
+
+**Templates** — Both `feature.md` and `feature-detailed.md` include optional screenshot verification (commented out). Uncomment for UI specs.
+
+---
+
+## Critical Success Factors
+
+**Small specs** — Each spec must fit in one context window. Break large features into smaller pieces.
+
+| Too Big | Right Size |
+| ------- | ---------- |
+| "Build entire auth system" | "Add login form" |
+| "Implement checkout flow" | "Add cart summary component" |
+
+**Fast feedback** — Build and tests must run quickly. Without fast feedback, broken code compounds.
+
+**Explicit criteria** — Done When must be verifiable, not vague.
+
+| Vague | Explicit |
+| ----- | -------- |
+| "Users can log in" | "POST `/api/login` returns JWT for valid credentials" |
+| "Handle errors" | "Invalid email returns 400 with message" |
+
+**Learnings compound** — By spec 10, Claude knows patterns from specs 1-9 via progress.txt.
+
+---
+
+## Common Gotchas
+
+**Stuck detection** — Triggers after 2 unchanged iterations. If stuck, try a different approach or break the spec smaller.
+
+**Idempotent migrations** — Use `IF NOT EXISTS` patterns:
+
+```sql
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+```
+
+**Interactive prompts** — Bypass with empty input:
+
+```bash
+echo -e "\n\n\n" | npm run db:generate
+```
+
+**Schema changes cascade** — After editing schema, check: server actions, UI components, API routes. Fixing related files is OK—not scope creep.
+
+**progress.txt grows** — Consider pruning between projects or moving permanent patterns to a learnings file.
+
+---
+
+## When NOT to Use
+
+- **Exploratory work** — Spikes, prototypes, "what if we tried..."
+- **Major refactors** — Cross-system changes without clear acceptance criteria
+- **Security-critical code** — Auth, payments, crypto—needs human review
+- **Cross-team dependencies** — Blocked by external APIs or other teams
+
+---
+
+## Browser Testing (UI specs only)
+
+For specs with UI changes, verify with screenshots before marking complete. Skip this for API-only specs.
+
+```bash
+# Using Playwright (install: npm i -D playwright)
+npx playwright screenshot http://localhost:3000/your-page screenshot.png
+
+# Or with a simple script
+cat > verify-ui.js << 'EOF'
+const { chromium } = require('playwright');
+(async () => {
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(process.env.URL || 'http://localhost:3000');
+  await page.screenshot({ path: 'screenshot.png' });
+  await browser.close();
+})();
+EOF
+node verify-ui.js
+```
+
+Add to your spec's Done When:
+
+- `[ ] Screenshot verified: UI matches expected layout`
 
 ---
 
