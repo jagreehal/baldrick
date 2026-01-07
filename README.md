@@ -2,9 +2,7 @@
 
 **AI-assisted feature execution for Claude Code.**
 
-👋 Hi ya, Ralph. Meet Baldrick.
-
-> "I have a cunning plan!" - Baldrick, Blackadder
+👋 Hi Ralph, meet the man with a cunning plan, Baldrick.
 
 ## Quick Start
 
