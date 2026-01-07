@@ -15,8 +15,6 @@ chmod +x baldrick
 ./baldrick status
 ```
 
-That's it.
-
 ---
 
 ## How It Works
@@ -54,20 +52,7 @@ created: 2025-01-06
 
 ## Flow
 
-```mermaid
-sequenceDiagram
-    User->>+API: POST /api/auth/login
-    API->>+DB: Find user by email
-    DB-->>-API: User record
-    API->>API: Verify password
-    alt Valid credentials
-        API-->>User: 200 + JWT token
-    else Invalid credentials
-        API-->>User: 401 Unauthorized
-    end
-```
-
-```
+```text
 ┌────────┐  credentials   ┌────────┐  lookup   ┌────────┐
 │  User  │───────────────>│  API   │──────────>│   DB   │
 └────────┘                └───┬────┘           └────────┘
