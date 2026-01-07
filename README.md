@@ -24,7 +24,9 @@ chmod +x baldrick
 3. Once done criteria pass, mark `passes: true`
 4. Repeat
 
-Each spec includes: context, scope boundaries, examples, BDD scenarios, mermaid diagrams, and done criteria.
+Each spec includes: context, scope boundaries, examples, BDD scenarios, diagrams, and done criteria.
+
+> **Note:** The gherkin syntax is for Claude to understand expected behavior—it's documentation, not executable Cucumber tests. Claude reads these scenarios and implements code + tests to match.
 
 ### Example Spec
 
@@ -82,11 +84,18 @@ When I POST to "/api/auth/login" with those credentials
 Then I receive a 200 response with a valid JWT token
 ```
 
-### Scenario: Invalid credentials
+### Scenario Outline: Login validation
 ```gherkin
 Given a user exists with email "alice@test.com" and password "Secret123"
-When I POST to "/api/auth/login" with wrong password
-Then I receive a 401 response with "Invalid credentials"
+When I POST to "/api/auth/login" with <email> and <password>
+Then I receive a <status> response with <body>
+
+Examples:
+  | email              | password    | status | body                    |
+  | alice@test.com     | Secret123   | 200    | valid JWT token         |
+  | alice@test.com     | wrong       | 401    | "Invalid credentials"   |
+  | unknown@test.com   | Secret123   | 401    | "Invalid credentials"   |
+  | not-an-email       | x           | 400    | "Invalid email format"  |
 ```
 
 ## Done When

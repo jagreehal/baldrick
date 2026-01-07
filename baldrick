@@ -239,6 +239,8 @@ created: [DATE]
 
 ## Scenarios
 
+> Gherkin syntax is documentation for Claude—not executable Cucumber tests.
+
 ### Scenario: [Happy path]
 ```gherkin
 Given [concrete precondition]
@@ -246,11 +248,17 @@ When [specific action]
 Then [explicit result]
 ```
 
-### Scenario: [Error case]
+### Scenario Outline: [Validation cases]
 ```gherkin
 Given [precondition]
-When [error trigger]
-Then [error handling]
+When [action with <input>]
+Then [expected <output>]
+
+Examples:
+  | input           | output              |
+  | valid_value     | success response    |
+  | invalid_value   | error message       |
+  | edge_case       | handled gracefully  |
 ```
 
 ## Done When
@@ -343,6 +351,8 @@ flowchart TD
 
 ## Scenarios
 
+> Gherkin syntax is documentation for Claude—not executable Cucumber tests.
+
 ### Scenario: [Happy path name]
 ```gherkin
 Given [concrete precondition with real values]
@@ -351,11 +361,19 @@ Then [explicit expected result]
 And [additional assertion]
 ```
 
-### Scenario: [Edge case name]
+### Scenario Outline: [Validation cases]
 ```gherkin
 Given [precondition]
-When [action with edge case input]
-Then [expected handling]
+When [action with <input>]
+Then I receive <status> with <response>
+
+Examples:
+  | input              | status | response                |
+  | valid_data         | 200    | success object          |
+  | missing_field      | 400    | "Field required"        |
+  | invalid_format     | 400    | "Invalid format"        |
+  | unauthorized       | 401    | "Authentication required"|
+  | not_found          | 404    | "Resource not found"    |
 ```
 
 ### Scenario: [Error case name]
