@@ -9,12 +9,8 @@
 ```bash
 curl -O https://raw.githubusercontent.com/jagreehal/baldrick/main/baldrick
 chmod +x baldrick
-./baldrick init
-```
-
-Edit `baldrick-features.json`, then:
-
-```bash
+./baldrick init spec
+./baldrick create login "user authentication"
 ./baldrick run 10
 ./baldrick status
 ```
@@ -25,47 +21,16 @@ That's it.
 
 ## How It Works
 
-```json
-{
-  "project": "My App",
-  "features": [
-    {
-      "category": "setup",
-      "description": "Initialise project with TypeScript and tests",
-      "passes": false
-    }
-  ]
-}
-```
+1. Define features as markdown specs with `passes: false`
+2. Claude picks the first incomplete spec, implements it
+3. Once done criteria pass, mark `passes: true`
+4. Repeat
 
-Claude picks the first incomplete feature (`passes: false`), implements it, marks it done (`passes: true`), moves on.
-
----
-
-## Spec Mode
-
-For complex features with BDD specs, mermaid diagrams, and structured examples:
-
-```bash
-./baldrick init spec
-
-./baldrick create login       # interactive - asks clarifying questions
-./baldrick vibe signup        # no questions - sensible defaults
-./baldrick spec checkout      # comprehensive - mermaid, ASCII, BDD
-
-./baldrick run 10
-./baldrick once login         # focus on single spec
-./baldrick status
-./baldrick docs login         # generate PR docs
-```
-
-Same simple tracking: `passes: false` → `passes: true`
-
-More documentation before coding: BDD scenarios, example tables, scope boundaries, done criteria.
+Each spec includes: context, scope boundaries, examples, BDD scenarios, mermaid diagrams, and done criteria.
 
 ### Example Spec
 
-```markdown
+````markdown
 ---
 title: "Login"
 passes: false
@@ -86,6 +51,34 @@ created: 2025-01-06
 
 **In:** Email/password form, validation, JWT token, error messages
 **Out:** OAuth, password reset, remember me, rate limiting
+
+## Flow
+
+```mermaid
+sequenceDiagram
+    User->>+API: POST /api/auth/login
+    API->>+DB: Find user by email
+    DB-->>-API: User record
+    API->>API: Verify password
+    alt Valid credentials
+        API-->>User: 200 + JWT token
+    else Invalid credentials
+        API-->>User: 401 Unauthorized
+    end
+```
+
+```
+┌────────┐  credentials   ┌────────┐  lookup   ┌────────┐
+│  User  │───────────────>│  API   │──────────>│   DB   │
+└────────┘                └───┬────┘           └────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               │               ▼
+        ┌──────────┐          │         ┌──────────┐
+        │ 200 JWT  │          │         │ 401 Error│
+        └──────────┘          │         └──────────┘
+                        valid?/invalid?
+```
 
 ## Examples
 
@@ -118,7 +111,7 @@ Then I receive a 401 response with "Invalid credentials"
 - [ ] Malformed email returns 400
 - [ ] Build passes
 - [ ] Tests pass
-```
+````
 
 Claude reads this spec, implements exactly what's defined, then sets `passes: true`.
 
@@ -126,19 +119,19 @@ Claude reads this spec, implements exactly what's defined, then sets `passes: tr
 
 ## Commands
 
-```bash
-./baldrick init                    # setup simple mode (JSON)
-./baldrick init spec               # setup spec mode (markdown)
-./baldrick run [n]                 # run n iterations (default: 10)
-./baldrick once <name> [--max n]  # run single spec until done (max iterations)
-./baldrick status                  # show status
-./baldrick create <name> [desc]   # create spec (interactive, optional description)
-./baldrick vibe <name> [desc]     # create spec (no questions, optional description)
-./baldrick spec <name> [desc]     # create comprehensive spec (optional description)
-./baldrick docs <name>            # generate PR docs
-./baldrick validate                # check specs for errors
-./baldrick help                    # show all commands
-```
+| Command | Description | Example |
+| ------- | ----------- | ------- |
+| `init` | Setup simple mode (JSON) | `./baldrick init` |
+| `init spec` | Setup spec mode (markdown) | `./baldrick init spec` |
+| `run [n]` | Run n iterations (default: 10) | `./baldrick run 5` |
+| `once <name> [--max n]` | Run single spec until done | `./baldrick once login --max 3` |
+| `status` | Show progress status | `./baldrick status` |
+| `create <name> [desc]` | Create spec interactively | `./baldrick create login "user auth"` |
+| `vibe <name> [desc]` | Create spec (no questions) | `./baldrick vibe signup` |
+| `spec <name> [desc]` | Create comprehensive spec | `./baldrick spec checkout` |
+| `docs <name>` | Generate PR documentation | `./baldrick docs login` |
+| `validate` | Check specs for errors | `./baldrick validate` |
+| `help` | Show all commands | `./baldrick help` |
 
 ---
 
