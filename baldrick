@@ -10,7 +10,7 @@ set -eo pipefail
 #   - Claude Code CLI installed and authenticated
 #   - Run /sandbox in Claude Code first for bash auto-allow
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # =============================================================================
@@ -794,16 +794,26 @@ cmd_run() {
     local NEXT_SPEC_NAME
     NEXT_SPEC_NAME=$(basename "$NEXT_SPEC" .md)
 
-    # Build context: selected spec prominently marked, plus all specs for reference
+    # Build context: selected spec fully, others as compact status (saves tokens)
     local CONTEXT="## SELECTED SPEC (implement this one)
 @${NEXT_SPEC}
 
-## All Specs (for reference)
+## Other Specs (status only)
 "
     for spec in "$SPECS_DIR"/*.md; do
       [[ -f "$spec" ]] || continue
       [[ "$(basename "$spec")" == _* ]] && continue
-      CONTEXT="$CONTEXT @$spec"
+      [[ "$spec" == "$NEXT_SPEC" ]] && continue  # Skip selected (already included)
+      local sname spasses
+      sname=$(basename "$spec" .md)
+      spasses=$(extract_field "$spec" "passes")
+      if [[ "$spasses" == "true" ]]; then
+        CONTEXT="$CONTEXT
+- $sname: ✓ done"
+      else
+        CONTEXT="$CONTEXT
+- $sname: pending"
+      fi
     done
     [[ -f "$DONE_FILE" ]] && echo "All specs complete!" && rm -f "$DONE_FILE" && show_summary && exit 0
 

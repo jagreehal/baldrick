@@ -14,6 +14,12 @@ Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) same lo
 
 See [design.md](design.md) for the full philosophy.
 
+## Why Loops Work
+
+Every AI coding session accumulates context: files read, commands run, wrong turns taken, half-baked plans. You can add but can't delete. Eventually it starts repeating itself, "fixing" the same bug different ways, confidently undoing its own work. That's **context pollution**.
+
+Baldrick doesn't try to clean the context. It throws it away and starts fresh. Progress persists in files (specs, progress.txt, git). Failures evaporate with the session. Each iteration reconstructs reality from the filesystem, not chat history.
+
 ```bash
 # Install (one file, no dependencies)
 curl -O https://raw.githubusercontent.com/jagreehal/baldrick/main/baldrick
@@ -250,7 +256,7 @@ Baldrick maintains `progress.txt` across iterations. Claude reads `## Codebase P
 - src/auth/login.ts - authentication logic
 ```
 
-For patterns that survive archiving, use `baldrick-learnings.md`.
+For patterns that survive archiving, use `baldrick-learnings.md`. This acts as **guardrails**: mistakes evaporate with each session, but lessons accumulate permanently. The same mistake shouldn't happen twice.
 
 ### 5. Handle Problems
 
