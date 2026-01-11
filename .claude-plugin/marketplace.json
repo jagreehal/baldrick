@@ -1,0 +1,28 @@
+{
+  "name": "baldrick-marketplace",
+  "owner": {
+    "name": "Jag Reehal"
+  },
+  "metadata": {
+    "description": "Baldrick - Ralph Wiggum-style AI coding loop for Claude Code",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "baldrick",
+      "source": "./",
+      "description": "AI coding loop with specs, skills, and observability. Deterministic task selection, feedback cycles, and stuck detection.",
+      "version": "1.0.0",
+      "license": "MIT",
+      "keywords": [
+        "ai-coding",
+        "autonomous",
+        "ralph-wiggum",
+        "specs",
+        "bdd",
+        "claude-code"
+      ],
+      "category": "automation"
+    }
+  ]
+}

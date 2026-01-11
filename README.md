@@ -1,351 +1,416 @@
 # baldrick
 
-**AI-assisted feature execution for Claude Code.**
+![Baldrick](baldrick.png)
 
-👋 Hi Ralph, meet the man with a cunning plan, Baldrick.
+> *"I have a cunning plan!"* - Baldrick, Blackadder
 
-## Quick Start
+Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) same loop concept, you define what "done" looks like and runs Claude repeatedly until it gets there, with added structure:
+
+- **Deterministic selection** — bash picks tasks mechanically (priority/risk), prevents AI from skipping hard work
+- **Redundant completion** — 3 signals must agree (done file + token + all specs pass), prevents false victories
+- **Feedback loops** — build/test/lint every iteration, reviewer mode every Nth (configurable, default 5) checks progress and fixes issues, self-correcting
+- **Full observability** — progress.txt (what happened), tradeoffs.md (why), logs/ (raw data)
+- **Works with any language** — configure build/test/lint commands for your stack (see [Configuration](#configuration))
+
+See [design.md](design.md) for the full philosophy.
 
 ```bash
+# Install (one file, no dependencies)
 curl -O https://raw.githubusercontent.com/jagreehal/baldrick/main/baldrick
 chmod +x baldrick
-./baldrick init spec
-./baldrick create login "user authentication"
-./baldrick run 10
-./baldrick status
+./baldrick init
 ```
 
----
+This creates:
 
-## How It Works
+```text
+specs/                  # Your feature specs go here
+templates/              # Spec templates (minimal, standard, detailed, example)
+progress.txt            # Session progress log
+baldrick-learnings.md   # Permanent patterns
+tradeoffs.md            # Decision log (auto-created if missing)
+logs/                   # Iteration logs (auto-created if missing)
+```
 
-1. Define features as markdown specs with `passes: false`
-2. Claude picks the first incomplete spec, implements it
-3. Once done criteria pass, mark `passes: true`
-4. Repeat
+**Requires:** [Claude Code CLI](https://docs.anthropic.com/claude-code) (configured with appropriate permissions)
 
-Each spec includes: context, scope boundaries, examples, BDD scenarios, diagrams, and done criteria.
-
-> **Note:** The gherkin syntax is for Claude to understand expected behaviour—it's documentation, not executable Cucumber tests. Claude reads these scenarios and implements code + tests to match.
-
-### The loop (every iteration)
-
-1. Read specs (`passes: false` first), `progress.txt`, and logs
-2. Implement the next spec only
-3. Run build, tests, and lint (`BUILD_CMD`, `TEST_CMD`, `LINT_CMD`)
-4. Flip the spec to `passes: true` when it satisfies Done When
-5. Append evidence and learnings to `progress.txt`
-6. Commit your work (the prompt asks Claude to do this)
-7. Stop when all specs pass or `.baldrick-done` exists
-
-Pseudo-loop:
+Now create a spec. This tells baldrick what "done" looks like:
 
 ```bash
-for ((i=1; i<=n; i++)); do
-  claude --permission-mode acceptEdits \
-    -p "@specs/*.md @progress.txt ... instructions"
-done
-```
-
-### Reviewer mode (every 5th iteration)
-
-Every 5th iteration, Claude switches from **Worker** to **Reviewer** mode:
-
-1. Check progress.txt — are we on track?
-2. Verify completed specs — do they actually work?
-3. Run tests to validate previous work
-4. Fix issues before moving on
-5. If stuck 2+ iterations, try a different approach
-
-This prevents broken code from compounding across iterations.
-
-### State and files
-
-- `specs/*.md` — feature specs with YAML frontmatter
-- `progress.txt` — session learnings (per-run context)
-- `baldrick-learnings.md` — permanent codebase patterns (survives across specs)
-- `logs/` — per-run logs
-- `docs/` — generated PR docs
-- `.baldrick-done` — file-based completion signal
-- `baldrick-features.json` — simple mode (JSON) if you use `./baldrick init`
-- `templates/` — spec templates shipped with the script
-
-After `./baldrick init spec`:
-
-```text
-specs/
-progress.txt
-logs/
-docs/
-templates/detailed/{feature.md, feature-detailed.md}
-```
-
-### Progress format (append in `progress.txt`)
-
-```markdown
-## 2025-01-07 - login
-- What was done: Implemented login happy path + errors
-- Test output: npm test (paste real output)
-- Next: Add rate limiting later
-```
-
-### Example Spec
-
-````markdown
+cat > specs/hello.md << 'EOF'
 ---
-title: "Login"
+title: "Add Hello Function"
 passes: false
-created: 2025-01-06
+---
+# Add Hello Function
+## Done When
+- [ ] Function `hello(name)` returns "Hello, {name}!"
+- [ ] Tests pass
+EOF
+```
+
+> For better results see templates (see [Spec Templates](#spec-templates))
+
+`passes: true` means the spec's Done When criteria are met **and** quality gates (build/test/lint) are green.
+
+Run it:
+
+```bash
+./baldrick run 1     # Run one iteration
+./baldrick status    # Check progress
+```
+
+That's it. Claude implements the feature, runs quality gates (build/test/lint), and commits when all checks pass.
+
 ---
 
-# Login
+## The Development Cycle
 
-> **One-liner:** Users authenticate with email and password
-
-## Context
-
-**User:** Registered users with existing accounts
-**Trigger:** User submits login form with email and password
-**Success:** User receives valid JWT token and can access protected routes
-
-## Scope
-
-**In:** Email/password form, validation, JWT token, error messages
-**Out:** OAuth, password reset, remember me, rate limiting
-
-## Flow
-
-```text
-┌────────┐  credentials   ┌────────┐  lookup   ┌────────┐
-│  User  │───────────────>│  API   │──────────>│   DB   │
-└────────┘                └───┬────┘           └────────┘
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Your specs/*.md                            │
+│                                                                 │
+│  YAML frontmatter + verifiable done criteria                    │
+└─────────────────────────────────────────────────────────────────┘
                               │
-              ┌───────────────┼───────────────┐
-              ▼               │               ▼
-        ┌──────────┐          │         ┌──────────┐
-        │ 200 JWT  │          │         │ 401 Error│
-        └──────────┘          │         └──────────┘
-                        valid?/invalid?
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   Baldrick Core (the loop)                      │
+│                                                                 │
+│  1. Select next incomplete spec (by priority)                   │
+│  2. Run Claude with spec as context                             │
+│  3. Claude implements the feature                               │
+│  4. Run tests/build/lint                                        │
+│  5. Commit changes                                              │
+│  6. Repeat until all specs pass                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                      Working code + commits
 ```
 
-## Examples
+The workflow is simple:
 
-| Input | Expected Output |
-|-------|-----------------|
-| `{email: "alice@test.com", password: "Secret123"}` | `200` + JWT token |
-| `{email: "wrong@test.com", password: "Secret123"}` | `401 Invalid credentials` |
-| `{email: "not-an-email", password: "x"}` | `400 Invalid email format` |
+1. **Define specs** — Write what "done" looks like
+2. **Run baldrick** — `./baldrick run 10`
+3. **Review code** — Check `git log`, `git diff`, read the changes
+4. **Repeat** — Add more specs as needed
 
-## Scenarios
-
-### Scenario: Successful login
-```gherkin
-Given a user exists with email "alice@test.com" and password "Secret123"
-When I POST to "/api/auth/login" with those credentials
-Then I receive a 200 response with a valid JWT token
-```
-
-### Scenario Outline: Login validation
-```gherkin
-Given a user exists with email "alice@test.com" and password "Secret123"
-When I POST to "/api/auth/login" with <email> and <password>
-Then I receive a <status> response with <body>
-
-Examples:
-  | email              | password    | status | body                    |
-  | alice@test.com     | Secret123   | 200    | valid JWT token         |
-  | alice@test.com     | wrong       | 401    | "Invalid credentials"   |
-  | unknown@test.com   | Secret123   | 401    | "Invalid credentials"   |
-  | not-an-email       | x           | 400    | "Invalid email format"  |
-```
-
-## Done When
-
-- [ ] POST `/api/auth/login` returns JWT for valid credentials
-- [ ] Invalid credentials return 401
-- [ ] Malformed email returns 400
-- [ ] Build passes
-- [ ] Tests pass
-````
-
-Claude reads this spec, implements exactly what's defined, then sets `passes: true`.
+Each iteration rebuilds context from files (specs + progress + learnings), not chat history—so it runs indefinitely without memory drift.
 
 ---
 
 ## Commands
 
-| Command | Description | Example |
-| ------- | ----------- | ------- |
-| `init` | Setup simple mode (JSON) | `./baldrick init` |
-| `init spec` | Setup spec mode (markdown) | `./baldrick init spec` |
-| `run [n]` | Run n iterations (default: 10) | `./baldrick run 5` |
-| `once <name> [--max n]` | Run single spec until done | `./baldrick once login --max 3` |
-| `status` | Show progress status | `./baldrick status` |
-| `create <name> [desc]` | Create spec interactively | `./baldrick create login "user auth"` |
-| `vibe <name> [desc]` | Create spec (no questions) | `./baldrick vibe signup` |
-| `spec <name> [desc]` | Create comprehensive spec | `./baldrick spec checkout` |
-| `docs <name>` | Generate PR documentation | `./baldrick docs login` |
-| `validate` | Check specs for errors | `./baldrick validate` |
-| `help` | Show all commands | `./baldrick help` |
-
----
-
-## Built-in Safeguards
-
-- Stuck detection: Warns after two unchanged iterations; nudges Claude to change approach.
-- Evidence required: Paste real build/test/lint output into `progress.txt`.
-- Completion signals: Either set all specs to `passes: true` or create `.baldrick-done`.
-- Single-spec focus: Each iteration works on one spec only to avoid thrash.
-
----
-
-## Monitoring
-
-Quick commands to check progress:
-
 ```bash
-# Spec status (requires jq)
-cat specs/*.md | grep -E "^(title|passes):" | paste - -
+# Execution
+./baldrick run [n] [--dry-run]    # Run n iterations (default: 10)
+./baldrick once <name> [--max n]  # Focus on single spec until done
 
-# Recent commits
-git log --oneline -10
+# Status
+./baldrick status                 # Show specs and progress
+./baldrick validate               # Check specs for errors
 
-# Learnings so far
-cat progress.txt | tail -50
+# Utilities
+./baldrick init                   # Setup project structure
+./baldrick archive                # Archive current session
+./baldrick archive list           # List archived sessions
+./baldrick archive restore <name> # Restore archived session
+./baldrick doctor                 # Check configuration
 ```
 
+**Aliases:** `s` → status, `r` → run, `v` → validate
+
 ---
 
-## Learnings Guidance
+## Spec Templates
 
-**Add to `baldrick-learnings.md`:**
+Don't want to start from scratch? Download a template:
 
-- "When modifying X, also update Y"
-- "This module uses pattern Z"
-- "Tests require dev server running"
+| Template | Description | Download |
+|----------|-------------|----------|
+| **Minimal** | Just `title` and `passes` | [View](templates/minimal.md) |
+| **Standard** | Adds context, examples, scenarios | [View](templates/standard.md) |
+| **Detailed** | Full spec with diagrams, dependencies | [View](templates/detailed.md) |
+| **Example** | Filled-in spec (task priority feature) | [View](templates/example.md) |
 
-**Don't add:**
-
-- Spec-specific details (goes in progress.txt)
-- Temporary notes
-- Info already documented elsewhere
+Or run `./baldrick init` to create templates locally in `templates/`.
 
 ---
 
 ## Configuration
 
-Edit lines 23-25 in `baldrick` for your project:
+Set these environment variables to customize baldrick:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BUILD_CMD` | `npm run build` | Build command |
+| `TEST_CMD` | `npm test` | Test command |
+| `LINT_CMD` | `npm run lint` | Lint command |
+| `QUALITY_TIER` | `production` | Hint to Claude: prototype (speed) / production (robust) / library (API stability) |
+| `REVIEW_EVERY` | `5` | Reviewer mode every N iterations |
+| `NOTIFY_CMD` | (none) | Notification webhook |
+
+**For non-Node projects**, set these before running:
 
 ```bash
-# Node.js (default)
-BUILD_CMD="npm run build"
-TEST_CMD="npm test"
-LINT_CMD="npm run lint"
-
 # Python
-BUILD_CMD=""
-TEST_CMD="pytest"
-LINT_CMD="ruff check ."
+export BUILD_CMD="python -m py_compile *.py"
+export TEST_CMD="pytest"
+export LINT_CMD="ruff check ."
 
-# Rust
-BUILD_CMD="cargo build"
-TEST_CMD="cargo test"
-LINT_CMD="cargo clippy"
+# Go
+export BUILD_CMD="go build ./..."
+export TEST_CMD="go test ./..."
+export LINT_CMD="golangci-lint run"
+
+# Or edit defaults in baldrick script (lines 30-32)
 ```
 
-**Templates** — Both `feature.md` and `feature-detailed.md` include optional screenshot verification (commented out). Uncomment for UI specs.
+**Check your setup:**
+
+```bash
+./baldrick doctor
+```
 
 ---
 
-## Critical Success Factors
+## Essential Tips
 
-**Small specs** — Each spec must fit in one context window. Break large features into smaller pieces.
+### 1. Baldrick Is A Loop
+
+AI coding evolved through phases: vibe coding → planning → multi-phase. Baldrick simplifies everything by running the same prompt in a loop:
+
+```bash
+for ((i=1; i<=n; i++)); do
+  SPEC=$(get_next_spec)  # Deterministic: priority → risk → date → id
+  claude -p "## SELECTED SPEC
+@$SPEC
+@progress.txt @baldrick-learnings.md @specs/*.md ..."
+done
+```
+
+The key: **Baldrick selects the task mechanically (by priority/risk). Claude implements it.**
+
+### 2. Write Clear Specs
+
+Instead of "implement login," describe exactly what login means:
+
+```yaml
+---
+title: "Login"
+passes: false
+priority: high    # high | medium | low (optional)
+risk: integration # spike | integration | standard | polish (optional)
+---
+
+# Login
+
+## Done When
+- [ ] POST `/api/auth/login` returns JWT
+- [ ] Invalid credentials return 401
+- [ ] Tests pass
+```
+
+**Spec should be so clear that Claude can implement it without asking questions.**
+
+**Right-sized specs:**
 
 | Too Big | Right Size |
-| ------- | ---------- |
-| "Build entire auth system" | "Add login form" |
-| "Implement checkout flow" | "Add cart summary component" |
+|---------|------------|
+| "Build entire auth" | "Add login endpoint" |
+| "Implement checkout" | "Add cart summary" |
+| "Refactor API layer" | "Extract validation" |
 
-**Fast feedback** — Build and tests must run quickly. Without fast feedback, broken code compounds.
+### 3. Use Feedback Loops
 
-**Explicit criteria** — Done When must be verifiable, not vague.
+The more feedback loops, the higher quality code:
 
-| Vague | Explicit |
-| ----- | -------- |
-| "Users can log in" | "POST `/api/login` returns JWT for valid credentials" |
-| "Handle errors" | "Invalid email returns 400 with message" |
+| Feedback Loop | What It Catches |
+|---------------|-----------------|
+| Build command | Compilation errors, missing deps |
+| Type checking | Type mismatches, missing props |
+| Unit tests | Broken logic, regressions |
+| Linting | Code style, potential bugs |
 
-**Learnings compound** — By spec 10, Claude knows patterns from specs 1-9 via progress.txt.
+**Claude can't declare victory if the tests are red.**
+
+### 4. Track Progress
+
+Baldrick maintains `progress.txt` across iterations. Claude reads `## Codebase Patterns` first before starting work:
+
+```markdown
+# Baldrick Progress Log
+
+## Codebase Patterns
+- Error handling: use CustomError from src/errors.ts
+- API responses: always wrap in { data, error } shape
+
+## Key Files
+- src/auth/login.ts - authentication logic
+```
+
+For patterns that survive archiving, use `baldrick-learnings.md`.
+
+### 5. Handle Problems
+
+**Reviewer Mode:** Every Nth iteration (configurable via `REVIEW_EVERY`, default 5), baldrick switches from Worker to Reviewer mode. The reviewer:
+- Checks progress.txt to verify we're on track
+- Verifies completed specs actually work (runs tests)
+- Fixes issues before continuing
+- Tries a different approach if stuck 2+ iterations
+
+This prevents broken code from compounding across iterations.
+
+**Stuck Detection:** If nothing changes for 2+ iterations, baldrick warns Claude to try a different approach. If truly stuck, outputs `<promise>BLOCKED</promise>` to stop.
+
+**Prevention:** Smaller specs, clear requirements, stable tests.
+
+### 6. Customize for Your Project
+
+```bash
+# AFK notifications
+NOTIFY_CMD="curl -d 'Baldrick done' ntfy.sh/my-topic"
+
+# macOS notification
+NOTIFY_CMD="osascript -e 'display notification \"Done\"'"
+
+# Quality tier
+QUALITY_TIER=production   # prototype | production | library
+```
 
 ---
 
-## Common Gotchas
+## Enhancing with Skills
 
-**Stuck detection** — Triggers after 2 unchanged iterations. If stuck, try a different approach or break the spec smaller.
+Skills add intelligence on top of baldrick's stable core. They're **optional** - baldrick works without them if you create specs manually.
 
-**Idempotent migrations** — Use `IF NOT EXISTS` patterns:
-
-```sql
-ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
-```
-
-**Interactive prompts** — Bypass with empty input:
+### Installing Skills
 
 ```bash
-echo -e "\n\n\n" | npm run db:generate
+# Global (all projects)
+cp -r skills/* ~/.claude/skills/
+
+# Per-project
+cp -r skills/ .claude/skills/
 ```
 
-**Schema changes cascade** — After editing schema, check: server actions, UI components, API routes. Fixing related files is OK—not scope creep.
+### Spec Creation Skills
 
-**progress.txt grows** — Consider pruning between projects or moving permanent patterns to a learnings file.
+Turn natural language intent into structured specs:
+
+| Skill | Purpose | When to Use |
+|-------|---------|-------------|
+| `spec-create` | Interactive spec with questions | Default for new features |
+| `spec-vibe` | Fast spec, no questions | Quick prototyping |
+| `spec-detailed` | Comprehensive with diagrams | Complex features |
+
+**Usage** (in Claude Code, type this as a prompt):
+
+```
+Load the spec-create skill and create a spec for user authentication
+```
+
+Skills are prompt files in `.claude/skills/`—tell Claude to load one, then describe your intent.
+
+### Loop Skills
+
+Specialized iteration patterns:
+
+| Skill | Purpose |
+|-------|---------|
+| `coverage-loop` | Increase test coverage to target % |
+| `lint-loop` | Fix all linting errors |
+| `entropy-loop` | Reduce code smells and duplication |
+| `pr-docs` | Generate PR documentation |
+
+Load the skill and describe your goal. The skill iterates until complete.
+
+---
+
+## Advanced Setup
+
+### From Marketplace
+
+```bash
+# Add the marketplace
+/plugin marketplace add jagreehal/baldrick
+
+# Install the plugin
+/plugin install baldrick@baldrick-marketplace
+```
+
+Or add to `.claude/settings.local.json`:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "baldrick-marketplace": {
+      "source": {
+        "source": "github",
+        "repo": "jagreehal/baldrick"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "baldrick@baldrick-marketplace": true
+  }
+}
+```
+
+### Testing & Mocking
+
+```bash
+# Source without executing
+source ./baldrick
+
+# Disable colors for test output
+NO_COLOR=1 ./baldrick status
+
+# Mock Claude for integration tests
+CLAUDE_RUNNER=./mock-claude.sh ./baldrick run 1
+```
+
+### Files Reference
+
+| File | Purpose |
+|------|---------|
+| `baldrick` | Core loop script (single file, self-contained) |
+| `specs/*.md` | Feature specs with YAML frontmatter |
+| `progress.txt` | Session learnings |
+| `baldrick-learnings.md` | Permanent patterns |
+| `logs/baldrick-*.log` | Raw Claude output |
+| `logs/iter-*.json` | Structured iteration data |
 
 ---
 
 ## When NOT to Use
 
-- **Exploratory work** — Spikes, prototypes, "what if we tried..."
-- **Major refactors** — Cross-system changes without clear acceptance criteria
-- **Security-critical code** — Auth, payments, crypto—needs human review
-- **Cross-team dependencies** — Blocked by external APIs or other teams
+- **Exploratory work** - Spikes, prototypes, "what if..."
+- **Major refactors** - Cross-system changes without clear criteria
+- **Security-critical code** - Auth, payments, crypto need human review
+- **Cross-team dependencies** - Blocked by external APIs
+
+For these, stay in human-in-the-loop mode.
 
 ---
 
-## Browser Testing (UI specs only)
+## Philosophy
 
-For specs with UI changes, verify with screenshots before marking complete. Skip this for API-only specs.
+1. **Specs over tasks.** Don't tell Claude what to do—tell it what done looks like.
+2. **Deterministic selection.** Baldrick picks the task mechanically (priority/risk). Claude implements.
+3. **Quality is explicit.** The agent doesn't know if this is prototype or production.
+4. **Small steps compound.** Many small commits beat one large commit.
+5. **Feedback loops are non-negotiable.** If tests are red, you're not done.
 
-```bash
-# Using Playwright (install: npm i -D playwright)
-npx playwright screenshot http://localhost:3000/your-page screenshot.png
-
-# Or with a simple script
-cat > verify-ui.js << 'EOF'
-const { chromium } = require('playwright');
-(async () => {
-  const browser = await chromium.launch();
-  const page = await browser.newPage();
-  await page.setViewportSize({ width: 1280, height: 900 });
-  await page.goto(process.env.URL || 'http://localhost:3000');
-  await page.screenshot({ path: 'screenshot.png' });
-  await browser.close();
-})();
-EOF
-node verify-ui.js
-```
-
-Add to your spec's Done When:
-
-- `[ ] Screenshot verified: UI matches expected layout`
-
----
-
-## Prerequisites
-
-- [Claude Code CLI](https://docs.anthropic.com/claude-code)
-- Run `/sandbox` in Claude Code first
+These aren't AI-specific ideas. They're just good engineering. Baldrick makes them automatic.
 
 ---
 
 ## License
 
 MIT
+
+---
+
+*Baldrick is named after the character from Blackadder who always had "a cunning plan." Unlike the TV character, this Baldrick's plans actually work.*

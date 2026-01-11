@@ -1,0 +1,20 @@
+{
+  "name": "baldrick",
+  "version": "1.0.0",
+  "description": "Ralph Wiggum-style AI coding loop with specs, skills, and observability. Run Claude Code autonomously until all specs pass.",
+  "author": {
+    "name": "Jag Reehal"
+  },
+  "repository": "https://github.com/jagreehal/baldrick",
+  "license": "MIT",
+  "keywords": [
+    "ai-coding",
+    "autonomous",
+    "ralph-wiggum",
+    "specs",
+    "bdd",
+    "claude-code",
+    "automation"
+  ],
+  "skills": "./skills/"
+}

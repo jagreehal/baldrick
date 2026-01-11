@@ -4,217 +4,1141 @@ set -eo pipefail
 # baldrick - AI-assisted feature execution for Claude Code
 # "I have a cunning plan!" - Baldrick, Blackadder
 #
+# Unified tool for spec creation and execution.
+#
 # Prerequisites:
 #   - Claude Code CLI installed and authenticated
 #   - Run /sandbox in Claude Code first for bash auto-allow
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Configuration - use PWD for project data, SCRIPT_DIR for script resources
-PROJECT_DIR="$PWD"
-SPECS_DIR="$PROJECT_DIR/specs"
-FEATURES_FILE="$PROJECT_DIR/baldrick-features.json"
-PROGRESS_FILE="$PROJECT_DIR/progress.txt"
-LEARNINGS_FILE="$PROJECT_DIR/baldrick-learnings.md"
-LOG_DIR="$PROJECT_DIR/logs"
-DOCS_DIR="$PROJECT_DIR/docs"
-TEMPLATES_DIR="$SCRIPT_DIR/templates"  # templates stay with script
-# Configure for your project (see README for examples)
-BUILD_CMD="npm run build"
-TEST_CMD="npm test"
-LINT_CMD="npm run lint"
+# =============================================================================
+# CONFIGURATION (can be overridden for testing)
+# =============================================================================
 
-# ============================================================================
-# SHARED HELPERS
-# ============================================================================
+: "${PROJECT_DIR:=$PWD}"
+: "${SPECS_DIR:=$PROJECT_DIR/specs}"
+: "${DOCS_DIR:=$PROJECT_DIR/docs}"
+: "${TEMPLATES_DIR:=$SCRIPT_DIR/templates}"
+: "${PROGRESS_FILE:=$PROJECT_DIR/progress.txt}"
+: "${LEARNINGS_FILE:=$PROJECT_DIR/baldrick-learnings.md}"
+: "${LOG_DIR:=$PROJECT_DIR/logs}"
+: "${ARCHIVE_DIR:=$PROJECT_DIR/archive}"
+: "${LAST_SESSION_FILE:=$PROJECT_DIR/.last-session}"
 
-# Extract field from YAML frontmatter
+# Build/test/lint commands - configure for your project
+: "${BUILD_CMD:=npm run build}"
+: "${TEST_CMD:=npm test}"
+: "${LINT_CMD:=npm run lint}"
+
+# Quality tier: prototype | production | library
+: "${QUALITY_TIER:=production}"
+
+# Reviewer cadence: run reviewer mode every N iterations
+: "${REVIEW_EVERY:=5}"
+
+# Notification command (optional)
+: "${NOTIFY_CMD:=}"
+
+# Claude runner - injectable for testing
+: "${CLAUDE_RUNNER:=claude}"
+
+# =============================================================================
+# EMBEDDED AGENT INSTRUCTIONS (no external baldrick-prompt.md needed)
+# =============================================================================
+
+# Note: read returns 1 at EOF even on success, so we use || true
+read -r -d '' EMBEDDED_PROMPT << 'PROMPT_EOF' || true
+# Baldrick Agent Instructions
+
+You are an autonomous coding agent working through feature specifications.
+
+## Your Task
+
+The core loop has **deterministically selected** the highest priority spec for you.
+Look for `## SELECTED SPEC` in the context - implement that one.
+
+1. Read `## Codebase Patterns` at TOP of `progress.txt` FIRST
+2. Read `baldrick-learnings.md` for permanent patterns
+3. Find the **SELECTED SPEC** section in the context (this is your target)
+4. Implement that single spec following BDD scenarios
+5. Run quality checks (see Configuration section below)
+6. If checks pass, commit ALL changes
+7. Update the spec to set `passes: true`
+8. Append progress to `progress.txt`
+
+**Important:** Do NOT pick a different spec. The core loop has already selected the correct one based on priority and dependency ordering.
+
+## Quality Requirements
+
+**CRITICAL**: ALL commits must pass quality checks.
+Run the build, test, and lint commands from the Configuration section.
+Do NOT set `passes: true` until ALL checks pass.
+PASTE the actual command output in your progress notes.
+
+## Progress Report Format
+
+APPEND to progress.txt (never replace, always append):
+
+```
+## [Date/Time] - [Spec Name]
+Session: [see Configuration section]
+- What: What was implemented
+- Test output: (paste actual command output)
+- Learnings: Patterns discovered, gotchas encountered
+---
+```
+
+The learnings section is critical - it helps future iterations avoid repeating mistakes.
+
+## Consolidate Patterns
+
+If you discover a **reusable pattern**, add it to BOTH:
+1. `## Codebase Patterns` section at TOP of progress.txt
+2. `baldrick-learnings.md` (permanent storage)
+
+Only add patterns that are **general and reusable**, not spec-specific details.
+
+## Log Tradeoffs
+
+When you make a significant decision, APPEND to `tradeoffs.md`:
+
+```
+## [Date] - [Decision Title]
+Spec: [spec name]
+Decision: [what you chose]
+Alternatives: [what you considered]
+Rationale: [why you chose this]
+---
+```
+
+**You MUST log a tradeoff when you:**
+- Change or introduce a data model / schema
+- Make a security or auth decision
+- Choose between architectural approaches
+- Introduce a new dependency
+- Change a public API contract
+
+Create `tradeoffs.md` if it doesn't exist. This file answers "why was it done this way?" for future maintainers.
+
+## Commit Message Format
+
+Use conventional commits:
+```
+feat: [Spec Name] - Brief description
+
+- Key change 1
+- Key change 2
+```
+
+## Stop Condition
+
+After completing a spec, check if ALL specs have `passes: true`.
+
+If ALL specs are complete and passing:
+1. `touch .baldrick-done`
+2. Output: `<promise>COMPLETE</promise>`
+
+If there are still specs with `passes: false`, end normally (another iteration will pick up the next spec).
+
+## Stuck Detection
+
+If you cannot make progress:
+- Try a DIFFERENT approach
+- Add debugging to understand the issue
+- Read errors carefully, fix root cause
+
+If truly blocked after multiple attempts:
+- Output: `<promise>BLOCKED</promise>` with explanation
+
+## Important Rules
+
+- Work on **ONE spec per iteration**
+- Commit frequently
+- Keep all checks passing
+- Read Codebase Patterns FIRST before implementing
+- Follow existing code patterns in the codebase
+PROMPT_EOF
+
+# =============================================================================
+# COLORS (testable: can be disabled with NO_COLOR=1)
+# =============================================================================
+
+if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'
+  BLUE='\033[0;34m'
+  CYAN='\033[0;36m'
+  BOLD='\033[1m'
+  DIM='\033[2m'
+  NC='\033[0m'
+else
+  RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' NC=''
+fi
+
+# =============================================================================
+# SPINNER (isolated for testing)
+# =============================================================================
+
+SPINNER_PID=""
+SPINNER_START=""
+
+start_spinner() {
+  local msg="${1:-Working}"
+  SPINNER_START=$(date +%s)
+  (
+    local chars="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    local i=0
+    while true; do
+      local elapsed=$(( $(date +%s) - SPINNER_START ))
+      local mins=$((elapsed / 60))
+      local secs=$((elapsed % 60))
+      printf "\r\033[K%s %s [%02d:%02d]" "${chars:i%10:1}" "$msg" "$mins" "$secs"
+      sleep 0.1
+      ((i++))
+    done
+  ) &
+  SPINNER_PID=$!
+  disown $SPINNER_PID 2>/dev/null
+}
+
+stop_spinner() {
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill $SPINNER_PID 2>/dev/null
+    wait $SPINNER_PID 2>/dev/null || true
+    SPINNER_PID=""
+    printf "\r\033[K"
+  fi
+}
+
+# =============================================================================
+# PURE UTILITY FUNCTIONS (no side effects, testable in isolation)
+# =============================================================================
+
+# Extract YAML frontmatter field from a file
 extract_field() {
-  local file="$1"
-  local field="$2"
-  sed -n '/^---$/,/^---$/p' "$file" | grep "^${field}:" | head -1 | sed "s/^${field}:[[:space:]]*//"
+  local file="$1" field="$2"
+  sed -n '/^---$/,/^---$/p' "$file" 2>/dev/null | \
+    grep "^${field}:" 2>/dev/null | head -1 | sed "s/^${field}:[[:space:]]*//" || true
 }
 
 # Check if spec passes
 spec_passes() {
-  local file="$1"
-  local passes=$(extract_field "$file" "passes")
-  [ "$passes" = "true" ]
+  [[ "$(extract_field "$1" "passes")" == "true" ]]
 }
 
-# Count specs by passes status
-count_specs() {
-  local count_passing="$1"
-  local count=0
+# Get priority from spec (defaults to medium)
+get_priority() {
+  local p
+  p=$(extract_field "$1" "priority")
+  echo "${p:-medium}"
+}
+
+# Get risk from spec (defaults to standard)
+get_risk() {
+  local r
+  r=$(extract_field "$1" "risk")
+  echo "${r:-standard}"
+}
+
+# Priority to numeric order for sorting
+priority_order() {
+  case "$1" in
+    high) echo 1 ;; medium) echo 2 ;; low) echo 3 ;; *) echo 2 ;;
+  esac
+}
+
+# Risk to numeric order for sorting
+risk_order() {
+  case "$1" in
+    spike) echo 1 ;; integration) echo 2 ;; standard) echo 3 ;; polish) echo 4 ;; *) echo 3 ;;
+  esac
+}
+
+# Find spec file by id field
+find_spec_by_id() {
+  local target_id="$1"
   for spec in "$SPECS_DIR"/*.md; do
-    [ -f "$spec" ] || continue
+    [[ -f "$spec" ]] || continue
+    local spec_id
+    spec_id=$(extract_field "$spec" "id")
+    if [[ "$spec_id" == "$target_id" ]]; then
+      echo "$spec"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Check if spec dependencies are satisfied
+# depends_on is an array of spec ids (not filenames)
+check_dependencies() {
+  local spec="$1"
+  local depends_on
+  depends_on=$(extract_field "$spec" "depends_on")
+
+  [[ -z "$depends_on" ]] && return 0  # No dependencies
+
+  # Clean up YAML array syntax: remove brackets, quotes, split by comma
+  depends_on="${depends_on#[}"
+  depends_on="${depends_on%]}"
+  depends_on="${depends_on//\"/}"
+  depends_on="${depends_on//\'/}"
+
+  # Split by comma and/or whitespace, check each dependency id
+  local dep_id dep_file
+  for dep_id in ${depends_on//,/ }; do
+    dep_id="${dep_id// /}"      # Trim whitespace
+    [[ -z "$dep_id" ]] && continue
+
+    # Find spec by id field
+    dep_file=$(find_spec_by_id "$dep_id")
+    if [[ -z "$dep_file" ]]; then
+      return 1  # Dependency id not found
+    fi
+    if ! spec_passes "$dep_file"; then
+      return 1  # Dependency not complete
+    fi
+  done
+
+  return 0
+}
+
+# Get created date from spec (for sorting)
+get_created() {
+  local c
+  c=$(extract_field "$1" "created")
+  echo "${c:-9999-99-99}"  # Default to far future if not set
+}
+
+# Get id from spec (for sorting)
+get_id() {
+  local id
+  id=$(extract_field "$1" "id")
+  echo "${id:-zzz}"  # Default to end of alphabet if not set
+}
+
+# Get the next spec to work on (deterministic selection)
+# Selection: priority (high→low) → risk (spike→polish) → created (old→new) → id (A→Z)
+get_next_spec() {
+  local candidates=()
+
+  for spec in "$SPECS_DIR"/*.md; do
+    [[ -f "$spec" ]] || continue
     [[ "$(basename "$spec")" == _* ]] && continue
-    if [ "$count_passing" = "true" ]; then
-      spec_passes "$spec" && ((count++)) || true
+
+    # Skip completed specs (passes = true)
+    spec_passes "$spec" && continue
+
+    # Skip specs with blocked_by set
+    local blocked_by
+    blocked_by=$(extract_field "$spec" "blocked_by")
+    [[ -n "$blocked_by" ]] && continue
+
+    # Skip specs with unmet dependencies
+    if ! check_dependencies "$spec"; then
+      continue
+    fi
+
+    candidates+=("$spec")
+  done
+
+  # No candidates
+  [[ ${#candidates[@]} -eq 0 ]] && return
+
+  # Sort candidates: priority (high→low) → risk (spike→polish) → created (old→new) → id (A→Z)
+  local best_spec=""
+  local best_p=999 best_r=999 best_c="9999-99-99" best_id="zzz"
+
+  for spec in "${candidates[@]}"; do
+    local p_order r_order created spec_id
+    p_order=$(priority_order "$(get_priority "$spec")")
+    r_order=$(risk_order "$(get_risk "$spec")")
+    created=$(get_created "$spec")
+    spec_id=$(get_id "$spec")
+
+    # Compare: priority → risk → created → id
+    local dominated=false
+    if [[ $p_order -lt $best_p ]]; then
+      dominated=false
+    elif [[ $p_order -gt $best_p ]]; then
+      dominated=true
+    elif [[ $r_order -lt $best_r ]]; then
+      dominated=false
+    elif [[ $r_order -gt $best_r ]]; then
+      dominated=true
+    elif [[ "$created" < "$best_c" ]]; then
+      dominated=false
+    elif [[ "$created" > "$best_c" ]]; then
+      dominated=true
+    elif [[ "$spec_id" < "$best_id" ]]; then
+      dominated=false
     else
-      spec_passes "$spec" || ((count++)) || true
+      dominated=true
+    fi
+
+    if [[ "$dominated" == "false" ]]; then
+      best_spec="$spec"
+      best_p=$p_order
+      best_r=$r_order
+      best_c="$created"
+      best_id="$spec_id"
     fi
   done
-  echo $count
+
+  echo "$best_spec"
 }
 
-# Validate a spec file
-validate_spec() {
-  local file="$1"
-  local errors=0
+# Get quality instructions based on tier
+get_quality_instructions() {
+  local tier="${1:-$QUALITY_TIER}"
+  case "$tier" in
+    prototype)
+      echo "## Quality: PROTOTYPE
+Speed over perfection. Skip edge cases. Minimal tests. Get it working first."
+      ;;
+    library)
+      echo "## Quality: LIBRARY
+Public API stability matters. Maintain backward compatibility. Document all public interfaces."
+      ;;
+    *)
+      echo "## Quality: PRODUCTION
+Maintainable code. Full test coverage. Handle errors properly. No shortcuts."
+      ;;
+  esac
+}
 
-  # Check frontmatter exists
-  if ! head -1 "$file" | grep -q '^---$'; then
-    echo "  ✗ Missing YAML frontmatter (must start with ---)"
-    ((errors++))
-  fi
+# =============================================================================
+# SESSION TRACKING
+# =============================================================================
 
-  # Check required fields
-  local title=$(extract_field "$file" "title")
-  local passes=$(extract_field "$file" "passes")
+SESSION_ID=""
 
-  [ -z "$title" ] && echo "  ✗ Missing required field: title" && ((errors++))
-  [ -z "$passes" ] && echo "  ✗ Missing required field: passes" && ((errors++))
+generate_session_id() {
+  SESSION_ID="baldrick-$(date +%Y%m%d%H%M%S)-$$"
+}
 
-  # Check passes is boolean
-  if [ -n "$passes" ]; then
-    if [ "$passes" != "true" ] && [ "$passes" != "false" ]; then
-      echo "  ✗ Invalid passes: '$passes' (must be: true or false)"
-      ((errors++))
+get_current_session() {
+  if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+    local branch
+    branch=$(git branch --show-current 2>/dev/null)
+    if [[ "$branch" == baldrick/* ]]; then
+      echo "$branch"
+      return
     fi
   fi
-
-  return $errors
-}
-
-# Show spec status table
-show_spec_list() {
-  echo ""
-  echo "╔══════════════════════════════════════════════════╗"
-  echo "║              Baldrick Spec Status                ║"
-  echo "╠══════════════════════════════════════════════════╣"
-  printf "║ %-4s │ %-40s ║\n" "" "Spec"
-  echo "╠──────┼──────────────────────────────────────────╣"
-
-  local total=0
-  local complete=0
-
-  for spec in "$SPECS_DIR"/*.md; do
-    [ -f "$spec" ] || continue
-    [[ "$(basename "$spec")" == _* ]] && continue
-    ((total++)) || true
-
-    local name=$(basename "$spec" .md)
-    local emoji="⭕"
-
-    if spec_passes "$spec"; then
-      emoji="✓"
-      ((complete++)) || true
+  if [[ -d "$SPECS_DIR" ]]; then
+    local first_spec
+    first_spec=$(ls -1 "$SPECS_DIR"/*.md 2>/dev/null | head -1)
+    if [[ -n "$first_spec" ]]; then
+      echo "specs/$(basename "$first_spec" .md)"
+      return
     fi
-
-    # Truncate long names
-    [ ${#name} -gt 40 ] && name="${name:0:37}..."
-
-    printf "║ %-4s │ %-40s ║\n" "$emoji" "$name"
-  done
-
-  echo "╚══════════════════════════════════════════════════╝"
-  echo ""
-  echo "Summary: $total total | $complete complete | $((total - complete)) remaining"
+  fi
   echo ""
 }
 
-# ============================================================================
+archive_session() {
+  local session_name="$1"
+  [[ -z "$session_name" ]] && return 1
+
+  local DATE FOLDER_NAME ARCHIVE_FOLDER
+  DATE=$(date +%Y-%m-%d)
+  FOLDER_NAME=$(echo "$session_name" | sed 's|^baldrick/||' | sed 's|^specs/||')
+  ARCHIVE_FOLDER="$ARCHIVE_DIR/$DATE-$FOLDER_NAME"
+
+  echo -e "${CYAN}Archiving: $session_name${NC}"
+  mkdir -p "$ARCHIVE_FOLDER"
+
+  if [[ -d "$SPECS_DIR" ]] && [[ -n "$(ls -A "$SPECS_DIR"/*.md 2>/dev/null)" ]]; then
+    mkdir -p "$ARCHIVE_FOLDER/specs"
+    cp "$SPECS_DIR"/*.md "$ARCHIVE_FOLDER/specs/" 2>/dev/null || true
+  fi
+  [[ -f "$PROGRESS_FILE" ]] && cp "$PROGRESS_FILE" "$ARCHIVE_FOLDER/"
+  [[ -f "$LEARNINGS_FILE" ]] && cp "$LEARNINGS_FILE" "$ARCHIVE_FOLDER/"
+  if [[ -d "$LOG_DIR" ]] && [[ -n "$(ls -A "$LOG_DIR" 2>/dev/null)" ]]; then
+    mkdir -p "$ARCHIVE_FOLDER/logs"
+    cp "$LOG_DIR"/*.log "$ARCHIVE_FOLDER/logs/" 2>/dev/null || true
+  fi
+
+  echo -e "${GREEN}  → $ARCHIVE_FOLDER${NC}"
+}
+
+check_session_change() {
+  local current
+  current=$(get_current_session)
+  [[ -z "$current" ]] && return 0
+
+  if [[ -f "$LAST_SESSION_FILE" ]]; then
+    local last
+    last=$(cat "$LAST_SESSION_FILE" 2>/dev/null || echo "")
+    if [[ -n "$last" ]] && [[ "$current" != "$last" ]]; then
+      echo -e "${YELLOW}Session change:${NC} $last → $current"
+      archive_session "$last"
+      cat > "$PROGRESS_FILE" <<EOF
+# Baldrick Progress Log
+
+## Codebase Patterns
+<!-- Consolidated reusable patterns - READ THIS FIRST -->
+
+## Key Files
+<!-- Critical files for this project -->
+
+---
+
+## Session: $current
+Started: $(date)
+
+<!-- Claude appends progress notes below this line -->
+EOF
+      rm -f "$LOG_DIR"/*.log 2>/dev/null || true
+    fi
+  fi
+  echo "$current" > "$LAST_SESSION_FILE"
+}
+
+notify_completion() {
+  local status="$1" iterations="$2" elapsed="$3"
+  if [[ -n "$NOTIFY_CMD" ]]; then
+    local msg="baldrick ${status}: ${iterations} iterations in ${elapsed}"
+    eval "$NOTIFY_CMD \"$msg\"" 2>/dev/null || true
+  fi
+}
+
+# =============================================================================
+# CLAUDE INTERFACE (injectable for testing)
+# =============================================================================
+
+CLAUDE_RESULT=""
+CLAUDE_EXIT=0
+
+run_claude() {
+  local prompt="$1" log_file="$2"
+  local temp exit_code
+  temp=$(mktemp)
+
+  start_spinner "Claude is working..."
+  $CLAUDE_RUNNER --permission-mode acceptEdits -p "$prompt" 2>&1 > "$temp"
+  exit_code=$?
+  stop_spinner
+
+  local lines
+  lines=$(wc -l < "$temp" | tr -d ' ')
+  echo -e "${GREEN}✓${NC} Claude responded ($lines lines)"
+
+  [[ -n "$log_file" ]] && cat "$temp" >> "$log_file"
+  CLAUDE_RESULT=$(cat "$temp")
+  CLAUDE_EXIT=$exit_code
+
+  rm -f "$temp"
+  return $exit_code
+}
+
+# =============================================================================
 # COMMAND: help
-# ============================================================================
+# =============================================================================
 
 cmd_help() {
   cat <<EOF
-baldrick v$VERSION - AI-assisted feature execution for Claude Code
+${BOLD}baldrick v$VERSION${NC} - AI-assisted feature execution
 
-Usage: ./baldrick <command> [options]
+${CYAN}Usage:${NC} baldrick <command> [options]
 
-Commands:
-  init                    Setup simple mode (JSON features)
-  init spec               Setup spec mode (markdown specs)
-  run [n]                 Run n iterations (default: 10)
-  once <name> [--max n]   Work on single spec until done
-  create <name> [desc]    Create spec (interactive)
-  vibe <name> [desc]      Create spec (no questions, sensible defaults)
-  spec <name> [desc]      Create comprehensive spec (mermaid, ASCII, BDD)
-  docs <name>             Generate PR documentation
-  status                  Show all specs and their status
-  validate                Check specs for required fields
-  help                    Show this help message
+${CYAN}Execution:${NC}
+  run [n] [--dry-run]     Run n iterations (default: 10)
+  once <spec> [--max n]   Focus on single spec until done
 
-Examples:
-  ./baldrick init                    # Setup simple mode (JSON)
-  ./baldrick init spec               # Setup spec mode (markdown)
-  ./baldrick run 10                  # Run 10 iterations
-  ./baldrick once user-auth          # Focus on one spec
-  ./baldrick create login            # Create spec (interactive)
-  ./baldrick vibe login              # Create spec (no questions)
-  ./baldrick spec checkout           # Create comprehensive spec
-  ./baldrick docs login              # Generate PR docs
-  ./baldrick status                  # Show spec status
+${CYAN}Status:${NC}
+  status                  Show specs and progress
+  validate                Check specs for errors
 
-Prerequisites:
-  - Claude Code CLI installed and authenticated
-  - Run /sandbox in Claude Code first
+${CYAN}Utilities:${NC}
+  init                    Setup templates and directories
+  archive [list|restore]  Manage session archives
+  doctor                  Check configuration and dependencies
+  help                    Show this help
+
+${CYAN}Aliases:${NC}
+  s → status    r → run    v → validate
+
+${CYAN}Configuration (env vars):${NC}
+  BUILD_CMD      Build command (default: npm run build)
+  TEST_CMD       Test command (default: npm test)
+  LINT_CMD       Lint command (default: npm run lint)
+  QUALITY_TIER   prototype | production | library
+  REVIEW_EVERY   Reviewer mode cadence (default: 5)
+
+${CYAN}Spec Creation (use Claude Code skills):${NC}
+  Load "spec-create" skill for interactive creation
+  Load "spec-vibe" skill for fast creation (no questions)
+  Load "spec-detailed" skill for comprehensive specs
+  Load "pr-docs" skill for PR documentation
+  Load "coverage-loop" skill for coverage-focused work
+  Load "lint-loop" skill for lint-fix work
+  Load "entropy-loop" skill for cleanup work
+
+${CYAN}Examples:${NC}
+  baldrick run 10
+  baldrick once login --max 20
+  baldrick status
 EOF
 }
 
-# ============================================================================
-# COMMAND: init
-# ============================================================================
+# =============================================================================
+# COMMAND: status
+# =============================================================================
 
-cmd_init() {
-  local spec_mode=false
+cmd_status() {
+  if [[ ! -d "$SPECS_DIR" ]] || [[ -z "$(ls -A "$SPECS_DIR"/*.md 2>/dev/null)" ]]; then
+    echo "No specs found in $SPECS_DIR"
+    echo ""
+    echo "Create specs with: baldrick create <name>"
+    exit 0
+  fi
+
+  echo ""
+  echo -e "${BOLD}╔═════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}║                     Baldrick Status                         ║${NC}"
+  echo -e "${BOLD}╠═════════════════════════════════════════════════════════════╣${NC}"
+  printf "║ %-3s │ %-8s │ %-11s │ %-28s ║\n" "" "Priority" "Risk" "Spec"
+  echo "╠─────┼──────────┼─────────────┼──────────────────────────────╣"
+
+  local total=0 complete=0 blocked_count=0
+
+  # Generate spec list with status
+  # Temporarily disable errexit for this section (fixes set -e + pipe interaction)
+  set +e
+  {
+    for spec in "$SPECS_DIR"/*.md; do
+      [[ -f "$spec" ]] || continue
+      [[ "$(basename "$spec")" == _* ]] && continue
+
+      local name priority risk p_order r_order status blocked_by
+      name=$(basename "$spec" .md)
+      priority=$(get_priority "$spec")
+      risk=$(get_risk "$spec")
+      p_order=$(priority_order "$priority")
+      r_order=$(risk_order "$risk")
+
+      # Determine status: done > blocked > pending
+      if spec_passes "$spec"; then
+        status="done"
+      else
+        blocked_by=$(extract_field "$spec" "blocked_by")
+        if [[ -n "$blocked_by" ]]; then
+          status="blocked"
+        elif check_dependencies "$spec"; then
+          status="pending"
+        else
+          status="blocked"
+        fi
+      fi
+
+      echo "${p_order}${r_order}|${status}|${priority}|${risk}|${name}"
+    done
+  } | sort | while IFS='|' read -r _ status priority risk name; do
+    [[ -z "$name" ]] && continue
+
+    local emoji="${YELLOW}⭕${NC}"
+    local dim=""
+    case "$status" in
+      done)    emoji="${GREEN}✓${NC}"; dim="${DIM}" ;;
+      blocked) emoji="${RED}🚫${NC}"; dim="${DIM}" ;;
+      pending) emoji="${YELLOW}⭕${NC}" ;;
+    esac
+
+    local pc="" rc=""
+    case "$priority" in
+      high) pc="${RED}" ;; medium) pc="${YELLOW}" ;; low) pc="${DIM}" ;;
+    esac
+    case "$risk" in
+      spike) rc="${RED}" ;; integration) rc="${YELLOW}" ;; polish) rc="${DIM}" ;;
+    esac
+
+    [[ ${#name} -gt 28 ]] && name="${name:0:25}..."
+    printf "║ %b │ %b%-8s%b │ %b%-11s%b │ %b%-28s%b ║\n" \
+      "$emoji" "$pc" "$priority" "$NC" "$rc" "$risk" "$NC" "$dim" "$name" "$NC"
+  done
+  set -e  # Re-enable errexit
+
+  echo -e "${BOLD}╚═════════════════════════════════════════════════════════════╝${NC}"
+
+  # Count stats (temporarily disable errexit for check_dependencies)
+  set +e
+  for spec in "$SPECS_DIR"/*.md; do
+    [[ -f "$spec" ]] || continue
+    [[ "$(basename "$spec")" == _* ]] && continue
+    ((total++))
+    if spec_passes "$spec"; then
+      ((complete++))
+    else
+      local blocked_by
+      blocked_by=$(extract_field "$spec" "blocked_by")
+      if [[ -n "$blocked_by" ]] || ! check_dependencies "$spec"; then
+        ((blocked_count++))
+      fi
+    fi
+  done
+  set -e
+
+  echo ""
+  local pct=0
+  [[ $total -gt 0 ]] && pct=$((complete * 100 / total))
+  echo -e "Progress: ${GREEN}$complete${NC}/$total (${pct}%)"
+  [[ $blocked_count -gt 0 ]] && echo -e "Blocked: ${RED}$blocked_count${NC} spec(s)"
+  echo -e "Quality: ${CYAN}$QUALITY_TIER${NC}"
+}
+
+# =============================================================================
+# COMMAND: run
+# =============================================================================
+
+cmd_run() {
+  local iterations="" DRY_RUN=false
 
   while [[ $# -gt 0 ]]; do
     case $1 in
-      spec) spec_mode=true; shift ;;
-      -h|--help)
-        echo "Usage: ./baldrick init [spec]"
-        echo "  spec   Setup with markdown specs instead of JSON"
-        exit 0
-        ;;
-      *) echo "Unknown option: $1"; exit 1 ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      -h|--help) echo "Usage: baldrick run [n] [--dry-run]"; exit 0 ;;
+      *)
+        if [[ "$1" =~ ^[0-9]+$ ]]; then iterations="$1"
+        else echo -e "${RED}Invalid:${NC} $1"; exit 1
+        fi
+        shift ;;
     esac
   done
 
-  echo "========================================"
-  echo "Baldrick Init"
-  echo "========================================"
+  iterations="${iterations:-10}"
+
+  if [[ ! -d "$SPECS_DIR" ]] || [[ -z "$(ls -A "$SPECS_DIR"/*.md 2>/dev/null)" ]]; then
+    echo -e "${RED}No specs found.${NC}"
+    echo "Create specs using a spec skill (spec-create, spec-vibe, etc.)"
+    exit 1
+  fi
+
+  # Pre-run validation
+  if ! cmd_validate --quiet; then
+    echo -e "${RED}Spec validation failed.${NC}"
+    echo "Run 'baldrick validate' for details."
+    exit 1
+  fi
+
+  check_session_change
+  generate_session_id
+
+  local LOG_FILE="$LOG_DIR/baldrick-$(date '+%Y%m%d-%H%M%S').log"
+  local DONE_FILE=".baldrick-done"
+  local PROMPT_FILE="/tmp/baldrick-prompt-$$.md"
+  mkdir -p "$LOG_DIR"
+  rm -f "$DONE_FILE"
+
+  # Write embedded prompt to temp file (cleaned up on exit)
+  echo "$EMBEDDED_PROMPT" > "$PROMPT_FILE"
+  trap "rm -f '$PROMPT_FILE'" EXIT
+
+  local START_TIME COMPLETED=0 LAST_HASH="" STUCK=0
+  START_TIME=$(date +%s)
+
+  get_state_hash() {
+    cat "$SPECS_DIR"/*.md 2>/dev/null | md5sum 2>/dev/null | cut -d' ' -f1 || \
+    cat "$SPECS_DIR"/*.md 2>/dev/null | md5 -q 2>/dev/null
+  }
+
+  show_summary() {
+    local end elapsed elapsed_str
+    end=$(date +%s)
+    elapsed=$((end - START_TIME))
+    elapsed_str="$((elapsed / 60))m $((elapsed % 60))s"
+    echo ""
+    echo -e "${BOLD}════════════════════════════════════════${NC}"
+    echo -e "Iterations: ${GREEN}$COMPLETED${NC}  Time: ${CYAN}$elapsed_str${NC}"
+    echo -e "Log: ${DIM}$LOG_FILE${NC}"
+    echo -e "${BOLD}════════════════════════════════════════${NC}"
+    notify_completion "complete" "$COMPLETED" "$elapsed_str"
+  }
+
+  trap 'stop_spinner; echo ""; echo -e "${YELLOW}Interrupted${NC}"; rm -f "$DONE_FILE"; show_summary; exit 130' INT
+
+  echo ""
+  echo -e "${BOLD}╔════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}║          baldrick run                  ║${NC}"
+  echo -e "${BOLD}╠════════════════════════════════════════╣${NC}"
+  echo -e "║ Iterations: ${CYAN}$iterations${NC}"
+  echo -e "║ Quality:    ${CYAN}$QUALITY_TIER${NC}"
+  [[ "$DRY_RUN" == true ]] && echo -e "║ Mode:       ${YELLOW}DRY RUN${NC}"
+  echo -e "${BOLD}╚════════════════════════════════════════╝${NC}"
   echo ""
 
-  mkdir -p "$SPECS_DIR" "$LOG_DIR" "$DOCS_DIR" "$TEMPLATES_DIR"
-  echo "✓ Created directories: specs/, logs/, docs/, templates/"
+  if [[ "$DRY_RUN" == true ]]; then
+    cmd_status
+    echo -e "Would run ${CYAN}$iterations${NC} iterations."
+    exit 0
+  fi
 
-  if [ ! -f "$PROGRESS_FILE" ]; then
-    cat > "$PROGRESS_FILE" <<'PROGRESS'
+  local QUALITY
+  QUALITY=$(get_quality_instructions)
+
+  for ((i=1; i<=iterations; i++)); do
+    # Deterministic spec selection (core decides, not Claude)
+    local NEXT_SPEC
+    NEXT_SPEC=$(get_next_spec)
+
+    if [[ -z "$NEXT_SPEC" ]]; then
+      echo "No incomplete unblocked specs found."
+      show_summary
+      exit 0
+    fi
+
+    local NEXT_SPEC_NAME
+    NEXT_SPEC_NAME=$(basename "$NEXT_SPEC" .md)
+
+    # Build context: selected spec prominently marked, plus all specs for reference
+    local CONTEXT="## SELECTED SPEC (implement this one)
+@${NEXT_SPEC}
+
+## All Specs (for reference)
+"
+    for spec in "$SPECS_DIR"/*.md; do
+      [[ -f "$spec" ]] || continue
+      [[ "$(basename "$spec")" == _* ]] && continue
+      CONTEXT="$CONTEXT @$spec"
+    done
+    [[ -f "$DONE_FILE" ]] && echo "All specs complete!" && rm -f "$DONE_FILE" && show_summary && exit 0
+
+    local ROLE="Worker" ROLE_INST=""
+    if [[ $((i % REVIEW_EVERY)) -eq 0 ]]; then
+      ROLE="Reviewer"
+      ROLE_INST="
+## REVIEWER MODE
+Before implementing, REVIEW:
+1. Check progress.txt - are we on track?
+2. Verify completed specs work: ${TEST_CMD}
+3. Fix issues before continuing.
+4. If stuck 2+ iterations, try different approach."
+    fi
+
+    echo "════════════════════════════════════════"
+    echo "Iteration $i/$iterations [$ROLE]"
+    echo -e "Spec: ${CYAN}$NEXT_SPEC_NAME${NC}"
+    echo "════════════════════════════════════════"
+
+    local HASH
+    HASH=$(get_state_hash)
+    if [[ "$HASH" == "$LAST_HASH" ]] && [[ -n "$LAST_HASH" ]]; then
+      ((STUCK++))
+      [[ $STUCK -ge 2 ]] && echo -e "${YELLOW}⚠ Stuck for $STUCK iterations${NC}"
+    else
+      STUCK=0
+      LAST_HASH="$HASH"
+    fi
+
+    echo "Iteration $i - $(date '+%Y-%m-%d %H:%M:%S') [$ROLE] Spec: $NEXT_SPEC_NAME" >> "$LOG_FILE"
+
+    local STUCK_WARN=""
+    [[ $STUCK -ge 2 ]] && STUCK_WARN="
+## ⚠ STUCK DETECTION
+No progress for $STUCK iterations. Try DIFFERENT approach:
+- Add debugging to understand the issue
+- Read errors carefully, fix root cause
+- Consider if approach is fundamentally wrong"
+
+    local LEARNINGS=""
+    [[ -f "$LEARNINGS_FILE" ]] && LEARNINGS="@${LEARNINGS_FILE}"
+
+    # Dynamic configuration prepended to prompt
+    local CONFIG="## Configuration
+- Build: ${BUILD_CMD}
+- Test: ${TEST_CMD}
+- Lint: ${LINT_CMD}
+- Session: ${SESSION_ID}
+- Done file: ${DONE_FILE}
+
+$QUALITY
+$ROLE_INST
+$STUCK_WARN
+"
+
+    local PROMPT="$CONFIG
+
+$CONTEXT @${PROGRESS_FILE} $LEARNINGS @${PROMPT_FILE}"
+
+    run_claude "$PROMPT" "$LOG_FILE" || { echo "Claude failed"; show_summary; exit 1; }
+    COMPLETED=$i
+
+    # Redundant completion check: all three signals must agree
+    local all_specs_pass=true
+    for spec in "$SPECS_DIR"/*.md; do
+      [[ -f "$spec" ]] || continue
+      [[ "$(basename "$spec")" == _* ]] && continue
+      if ! spec_passes "$spec"; then
+        all_specs_pass=false
+        break
+      fi
+    done
+
+    local has_done_file=false
+    [[ -f "$DONE_FILE" ]] && has_done_file=true
+
+    local has_complete_token=false
+    [[ "$CLAUDE_RESULT" == *"<promise>COMPLETE</promise>"* ]] && has_complete_token=true
+
+    # All three conditions must be true for completion
+    if [[ "$all_specs_pass" == "true" ]] && \
+       [[ "$has_done_file" == "true" ]] && \
+       [[ "$has_complete_token" == "true" ]]; then
+      echo -e "${GREEN}All specs complete!${NC} (verified: file + token + all passes)"
+      rm -f "$DONE_FILE"
+      show_summary
+      exit 0
+    fi
+
+    # Warn if signals disagree (helps debug false completion attempts)
+    if [[ "$has_done_file" == "true" ]] && [[ "$all_specs_pass" != "true" ]]; then
+      echo -e "${YELLOW}WARNING:${NC} .baldrick-done exists but not all specs pass - cleaning up"
+      rm -f "$DONE_FILE"
+    fi
+
+    if [[ "$has_complete_token" == "true" ]] && [[ "$all_specs_pass" != "true" ]]; then
+      echo -e "${YELLOW}WARNING:${NC} COMPLETE token received but not all specs pass - continuing"
+    fi
+
+    # Write per-iteration JSON artifact for observability
+    local iter_file="$LOG_DIR/iter-$(printf '%04d' $i).json"
+    cat > "$iter_file" << EOF
+{
+  "iteration": $i,
+  "timestamp": "$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')",
+  "selected_spec": "$NEXT_SPEC_NAME",
+  "state_hash": "$HASH",
+  "mode": "$ROLE",
+  "stuck_count": $STUCK,
+  "completion_signals": {
+    "done_file": $has_done_file,
+    "complete_token": $has_complete_token,
+    "all_specs_pass": $all_specs_pass
+  }
+}
+EOF
+
+    echo ""
+  done
+
+  echo "Completed $iterations iterations"
+  rm -f "$DONE_FILE"
+  show_summary
+}
+
+# =============================================================================
+# COMMAND: once (single spec focus)
+# =============================================================================
+
+cmd_once() {
+  local spec_name="" max_iterations=30
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --max) max_iterations="$2"; shift 2 ;;
+      -h|--help) echo "Usage: baldrick once <spec-name> [--max n]"; exit 0 ;;
+      *) [[ -z "$spec_name" ]] && spec_name="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$spec_name" ]] && echo "Error: spec name required" && exit 1
+
+  local spec_file="$SPECS_DIR/${spec_name}.md"
+  [[ "$spec_name" == *.md ]] && spec_file="$SPECS_DIR/$spec_name" && spec_name="${spec_name%.md}"
+
+  [[ ! -f "$spec_file" ]] && echo "Not found: $spec_file" && exit 1
+
+  check_session_change
+  generate_session_id
+
+  local LOG_FILE="$LOG_DIR/baldrick-once-${spec_name}-$(date '+%Y%m%d-%H%M%S').log"
+  local DONE_FILE=".baldrick-done-${spec_name}"
+  local PROMPT_FILE="/tmp/baldrick-prompt-$$.md"
+  mkdir -p "$LOG_DIR"
+  rm -f "$DONE_FILE"
+
+  # Write embedded prompt to temp file (cleaned up on exit)
+  echo "$EMBEDDED_PROMPT" > "$PROMPT_FILE"
+  trap "rm -f '$PROMPT_FILE'" EXIT
+
+  local START_TIME COMPLETED=0 LAST_HASH="" STUCK=0
+  START_TIME=$(date +%s)
+
+  get_spec_hash() { md5sum "$spec_file" 2>/dev/null | cut -d' ' -f1 || md5 -q "$spec_file" 2>/dev/null; }
+
+  echo ""
+  echo -e "${BOLD}baldrick once: $spec_name${NC}"
+  echo -e "Max iterations: ${CYAN}$max_iterations${NC}"
+  echo ""
+
+  trap 'stop_spinner; echo "Interrupted after $COMPLETED iterations"; rm -f "$DONE_FILE"; exit 130' INT
+
+  local LEARNINGS=""
+  [[ -f "$LEARNINGS_FILE" ]] && LEARNINGS="@${LEARNINGS_FILE}"
+  local QUALITY
+  QUALITY=$(get_quality_instructions)
+
+  for ((i=1; i<=max_iterations; i++)); do
+    [[ -f "$DONE_FILE" ]] && echo -e "${GREEN}Complete: $spec_name${NC}" && rm -f "$DONE_FILE" && exit 0
+
+    local ROLE="Worker" ROLE_INST=""
+    if [[ $((i % REVIEW_EVERY)) -eq 0 ]]; then
+      ROLE="Reviewer"
+      ROLE_INST="
+## REVIEWER MODE
+Before continuing, REVIEW:
+1. Does current implementation match the spec?
+2. Run tests: ${TEST_CMD}
+3. Fix issues before moving on."
+    fi
+
+    echo "[$spec_name] Iteration $i/$max_iterations [$ROLE]"
+
+    local HASH
+    HASH=$(get_spec_hash)
+    if [[ "$HASH" == "$LAST_HASH" ]] && [[ -n "$LAST_HASH" ]]; then
+      ((STUCK++))
+      [[ $STUCK -ge 2 ]] && echo -e "${YELLOW}⚠ Stuck for $STUCK iterations${NC}"
+    else
+      STUCK=0
+      LAST_HASH="$HASH"
+    fi
+
+    local STUCK_WARN=""
+    [[ $STUCK -ge 2 ]] && STUCK_WARN="
+## ⚠ STUCK
+No progress for $STUCK iterations. Try DIFFERENT approach or output <promise>BLOCKED</promise> if truly stuck."
+
+    # Dynamic configuration prepended to prompt
+    local CONFIG="## Configuration
+- Build: ${BUILD_CMD}
+- Test: ${TEST_CMD}
+- Lint: ${LINT_CMD}
+- Session: ${SESSION_ID}
+- Done file: ${DONE_FILE}
+
+$QUALITY
+$ROLE_INST
+$STUCK_WARN
+
+## Focus Mode
+Work ONLY on this spec: $spec_name
+(Ignore priority selection - focus on this single spec)
+"
+
+    local PROMPT="$CONFIG
+
+@${spec_file} @${PROGRESS_FILE} $LEARNINGS @${PROMPT_FILE}"
+
+    run_claude "$PROMPT" "$LOG_FILE" || { echo "Claude failed"; exit 1; }
+    COMPLETED=$i
+
+    if [[ -f "$DONE_FILE" ]] || [[ "$CLAUDE_RESULT" == *"<promise>COMPLETE</promise>"* ]]; then
+      echo -e "${GREEN}Complete: $spec_name${NC}"
+      rm -f "$DONE_FILE"
+      exit 0
+    fi
+
+    if [[ "$CLAUDE_RESULT" == *"<promise>BLOCKED</promise>"* ]]; then
+      echo -e "${RED}Blocked: $spec_name${NC} - check progress.txt"
+      rm -f "$DONE_FILE"
+      exit 1
+    fi
+  done
+
+  echo -e "${YELLOW}Max iterations reached for $spec_name${NC}"
+  rm -f "$DONE_FILE"
+  exit 1
+}
+
+# =============================================================================
+# COMMAND: archive
+# =============================================================================
+
+cmd_archive() {
+  case "${1:-}" in
+    list)
+      echo ""
+      echo -e "${BOLD}Archived Sessions${NC}"
+      echo ""
+      if [[ ! -d "$ARCHIVE_DIR" ]] || [[ -z "$(ls -A "$ARCHIVE_DIR" 2>/dev/null)" ]]; then
+        echo "No archives found."
+        exit 0
+      fi
+      for archive in "$ARCHIVE_DIR"/*/; do
+        [[ -d "$archive" ]] || continue
+        local name specs
+        name=$(basename "$archive")
+        specs=0
+        [[ -d "$archive/specs" ]] && specs=$(ls -1 "$archive/specs"/*.md 2>/dev/null | wc -l | tr -d ' ')
+        echo -e "  ${CYAN}$name${NC} ($specs specs)"
+      done
+      ;;
+    restore)
+      local name="$2"
+      [[ -z "$name" ]] && echo "Usage: baldrick archive restore <name>" && exit 1
+      local path="$ARCHIVE_DIR/$name"
+      [[ ! -d "$path" ]] && echo "Not found: $name" && exit 1
+
+      echo "Restoring: $name"
+      [[ -d "$path/specs" ]] && mkdir -p "$SPECS_DIR" && cp "$path/specs"/*.md "$SPECS_DIR/" 2>/dev/null
+      [[ -f "$path/progress.txt" ]] && cp "$path/progress.txt" "$PROGRESS_FILE"
+      [[ -f "$path/baldrick-learnings.md" ]] && cp "$path/baldrick-learnings.md" "$LEARNINGS_FILE"
+      echo "restored/$name" > "$LAST_SESSION_FILE"
+      echo -e "${GREEN}Restored.${NC}"
+      ;;
+    -h|--help)
+      echo "Usage: baldrick archive [list|restore <name>]"
+      ;;
+    "")
+      local current
+      current=$(get_current_session)
+      [[ -z "$current" ]] && echo "No session to archive." && exit 1
+      archive_session "$current"
+      rm -f "$LAST_SESSION_FILE"
+      echo -e "${GREEN}Archived.${NC}"
+      ;;
+    *)
+      echo "Unknown: $1"
+      exit 1
+      ;;
+  esac
+}
+
+# =============================================================================
+# COMMAND: init (from blackadder)
+# =============================================================================
+
+cmd_init() {
+  echo -e "${BOLD}baldrick init${NC}"
+  echo ""
+
+  mkdir -p "$SPECS_DIR" "$DOCS_DIR" "$TEMPLATES_DIR"
+  echo -e "${GREEN}✓${NC} Created: specs/, docs/, templates/"
+
+  if [[ ! -f "$PROGRESS_FILE" ]]; then
+    cat > "$PROGRESS_FILE" <<'EOF'
 # Baldrick Progress Log
 
 ## Codebase Patterns
 <!-- Add reusable patterns here as you discover them -->
-<!-- - Migrations: use IF NOT EXISTS -->
-<!-- - API responses: wrap in { data, error } -->
 
 ## Key Files
 <!-- Add critical files here -->
-<!-- - src/db/schema.ts -->
-<!-- - src/lib/auth.ts -->
 
 ---
 
 <!-- Claude appends progress notes below this line -->
-PROGRESS
-    echo "✓ Created progress.txt"
+EOF
+    echo -e "${GREEN}✓${NC} Created: progress.txt"
   fi
 
-  if [ ! -f "$LEARNINGS_FILE" ]; then
-    cat > "$LEARNINGS_FILE" <<'LEARNINGS'
+  if [[ ! -f "$LEARNINGS_FILE" ]]; then
+    cat > "$LEARNINGS_FILE" <<'EOF'
 # Baldrick Learnings
 
 Permanent patterns and knowledge about this codebase.
@@ -224,33 +1148,32 @@ Update this when you discover something reusable across specs.
 
 <!-- Add patterns here, e.g.: -->
 <!-- - Error handling: use CustomError class from src/errors.ts -->
-<!-- - Tests: Jest with __tests__ directories -->
 <!-- - API responses: always wrap in { data, error } shape -->
 
 ## Key Files
 
 <!-- Add critical files here, e.g.: -->
 <!-- - src/db/schema.ts - database schema -->
-<!-- - src/lib/auth.ts - authentication helpers -->
 
 ## Gotchas
 
 <!-- Add project-specific gotchas, e.g.: -->
 <!-- - Must run db:generate after schema changes -->
-<!-- - ENV vars loaded from .env.local in dev -->
-LEARNINGS
-    echo "✓ Created baldrick-learnings.md"
+EOF
+    echo -e "${GREEN}✓${NC} Created: baldrick-learnings.md"
   fi
 
-  if [ "$spec_mode" = true ]; then
-    mkdir -p "$TEMPLATES_DIR/detailed"
-
-    if [ ! -f "$TEMPLATES_DIR/detailed/feature.md" ]; then
-      cat > "$TEMPLATES_DIR/detailed/feature.md" <<'TEMPLATE'
+  # Create simple template
+  if [[ ! -f "$TEMPLATES_DIR/feature.md" ]]; then
+    cat > "$TEMPLATES_DIR/feature.md" <<'EOF'
 ---
+id: [feature-name-v1]   # Unique identifier (kebab-case)
 title: "[FEATURE_TITLE]"
 passes: false
+priority: medium        # high | medium | low
+risk: standard          # spike | integration | standard | polish
 created: [DATE]
+depends_on: []          # Array of spec ids (optional)
 ---
 
 # [FEATURE_TITLE]
@@ -274,11 +1197,8 @@ created: [DATE]
 |-------|-----------------|
 | `[real example input]` | `[real example output]` |
 | `[edge case input]` | `[edge case handling]` |
-| `[error trigger]` | `[error response]` |
 
 ## Scenarios
-
-> Gherkin syntax is documentation for Claude—not executable Cucumber tests.
 
 ### Scenario: [Happy path]
 ```gherkin
@@ -297,7 +1217,6 @@ Examples:
   | input           | output              |
   | valid_value     | success response    |
   | invalid_value   | error message       |
-  | edge_case       | handled gracefully  |
 ```
 
 ## Done When
@@ -306,18 +1225,21 @@ Examples:
 - [ ] [Specific criterion 2]
 - [ ] Build passes
 - [ ] Tests pass
-<!-- For UI specs only: -->
-<!-- - [ ] Screenshot verified: UI matches expected layout -->
-TEMPLATE
-      echo "✓ Created templates/detailed/feature.md"
-    fi
+EOF
+    echo -e "${GREEN}✓${NC} Created: templates/feature.md"
+  fi
 
-    if [ ! -f "$TEMPLATES_DIR/detailed/feature-detailed.md" ]; then
-      cat > "$TEMPLATES_DIR/detailed/feature-detailed.md" <<'TEMPLATE'
+  # Create detailed template
+  if [[ ! -f "$TEMPLATES_DIR/feature-detailed.md" ]]; then
+    cat > "$TEMPLATES_DIR/feature-detailed.md" <<'EOF'
 ---
+id: [feature-name-v1]   # Unique identifier (kebab-case)
 title: "[FEATURE_TITLE]"
 passes: false
+priority: medium        # high | medium | low
+risk: standard          # spike | integration | standard | polish
 created: [DATE]
+depends_on: []          # Array of spec ids (optional)
 ---
 
 # [FEATURE_TITLE]
@@ -374,25 +1296,20 @@ flowchart TD
 | Input | Action | Output |
 |-------|--------|--------|
 | `alice@example.com, secret123` | Login | `{token: "abc...", user: {id: 1}}` |
-| `{name: "Test Item"}` | Create | `{id: 1, name: "Test Item", created: "..."}` |
 
 ### Edge Cases
 | Input | Condition | Expected |
 |-------|-----------|----------|
 | `""` | Empty email | `400: {error: "Email required"}` |
 | `not-an-email` | Invalid format | `400: {error: "Invalid email"}` |
-| `unknown@test.com` | User not found | `404: {error: "User not found"}` |
 
 ### Error Responses
 | Trigger | Code | Response |
 |---------|------|----------|
 | Invalid credentials | 401 | `{error: "Invalid credentials"}` |
-| Missing auth token | 401 | `{error: "Authentication required"}` |
 | Server error | 500 | `{error: "Internal server error"}` |
 
 ## Scenarios
-
-> Gherkin syntax is documentation for Claude—not executable Cucumber tests.
 
 ### Scenario: [Happy path name]
 ```gherkin
@@ -413,8 +1330,6 @@ Examples:
   | valid_data         | 200    | success object          |
   | missing_field      | 400    | "Field required"        |
   | invalid_format     | 400    | "Invalid format"        |
-  | unauthorized       | 401    | "Authentication required"|
-  | not_found          | 404    | "Resource not found"    |
 ```
 
 ### Scenario: [Error case name]
@@ -431,8 +1346,6 @@ And [side effects - e.g., "no data is modified"]
 src/
 ├── [path]/
 │   └── [file.ts]        # [What this file does]
-├── [path]/
-│   └── [file.ts]        # [Purpose]
 └── tests/
     └── [file.test.ts]   # Tests for this feature
 ```
@@ -445,774 +1358,261 @@ src/
 - [ ] Build passes
 - [ ] Tests pass with new tests
 - [ ] Manual: [Specific verification step]
-<!-- For UI specs only: -->
-<!-- - [ ] Screenshot verified: UI matches expected layout -->
-TEMPLATE
-      echo "✓ Created templates/detailed/feature-detailed.md"
-    fi
-
-    echo ""
-    echo "Detailed mode initialised!"
-    echo ""
-    echo "Next steps:"
-    echo "  1. ./baldrick create my-feature"
-    echo "  2. Review specs/my-feature.md"
-    echo "  3. ./baldrick run 10"
-  else
-    if [ ! -f "$FEATURES_FILE" ]; then
-      cat > "$FEATURES_FILE" <<'JSON'
-{
-  "project": "My Project",
-  "features": [
-    {
-      "category": "setup",
-      "description": "Initialise project structure",
-      "passes": false
-    }
-  ]
-}
-JSON
-      echo "✓ Created baldrick-features.json"
-    fi
-
-    echo ""
-    echo "Simple mode initialised!"
-    echo ""
-    echo "Next steps:"
-    echo "  1. Edit baldrick-features.json"
-    echo "  2. ./baldrick run 10"
-  fi
-}
-
-# ============================================================================
-# COMMAND: status
-# ============================================================================
-
-cmd_status() {
-  # Check for simple mode (JSON file)
-  if [ -f "$FEATURES_FILE" ]; then
-    echo ""
-    echo "Simple Mode - baldrick-features.json"
-    echo ""
-    local total=$(jq '.features | length' "$FEATURES_FILE")
-    local complete=$(jq '[.features[] | select(.passes == true)] | length' "$FEATURES_FILE")
-    echo "Features: $total total | $complete complete | $((total - complete)) remaining"
-    echo ""
-    jq -r '.features[] | if .passes then "✓" else "⭕" end + " " + .description' "$FEATURES_FILE"
-    echo ""
-    return
+EOF
+    echo -e "${GREEN}✓${NC} Created: templates/feature-detailed.md"
   fi
 
-  # Detailed mode (spec files)
-  if [ ! -d "$SPECS_DIR" ] || [ -z "$(ls -A "$SPECS_DIR"/*.md 2>/dev/null)" ]; then
-    echo "No specs found in $SPECS_DIR"
-    echo ""
-    echo "Create one with: ./baldrick create <name>"
-    exit 0
-  fi
-
-  show_spec_list
+  echo ""
+  echo -e "${GREEN}Done!${NC}"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Create a spec in specs/ (see templates/ for examples)"
+  echo "  2. baldrick validate"
+  echo "  3. baldrick run 10"
 }
 
-# ============================================================================
-# COMMAND: validate
-# ============================================================================
+# =============================================================================
+# COMMAND: validate (from blackadder)
+# =============================================================================
 
 cmd_validate() {
-  echo ""
-  echo "Validating specs in $SPECS_DIR..."
-  echo ""
+  local quiet=false
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --quiet|-q) quiet=true; shift ;;
+      *) shift ;;
+    esac
+  done
 
-  local total=0
-  local errors=0
+  [[ "$quiet" != true ]] && echo "" && echo -e "${BOLD}Validating specs${NC}" && echo ""
+
+  if [[ ! -d "$SPECS_DIR" ]] || [[ -z "$(ls -A "$SPECS_DIR"/*.md 2>/dev/null)" ]]; then
+    [[ "$quiet" != true ]] && echo "No specs found in $SPECS_DIR"
+    return 0
+  fi
+
+  local total=0 errors=0 warnings=0
 
   for spec in "$SPECS_DIR"/*.md; do
-    [ -f "$spec" ] || continue
+    [[ -f "$spec" ]] || continue
     [[ "$(basename "$spec")" == _* ]] && continue
     ((total++))
 
-    local name=$(basename "$spec" .md)
-    echo "Checking: $name"
+    local name spec_errors spec_warnings
+    name=$(basename "$spec" .md)
+    spec_errors=0
+    spec_warnings=0
 
-    if ! validate_spec "$spec"; then
+    # Check frontmatter exists
+    if ! head -1 "$spec" | grep -q '^---$'; then
+      [[ "$quiet" != true ]] && echo -e "  ${RED}✗${NC} $name: Missing YAML frontmatter"
+      ((spec_errors++))
+    fi
+
+    # Extract all fields
+    local title passes priority risk created
+    title=$(extract_field "$spec" "title")
+    passes=$(extract_field "$spec" "passes")
+    priority=$(extract_field "$spec" "priority")
+    risk=$(extract_field "$spec" "risk")
+    created=$(extract_field "$spec" "created")
+
+    # Required: title (non-empty)
+    if [[ -z "$title" ]]; then
+      [[ "$quiet" != true ]] && echo -e "  ${RED}✗${NC} $name: Missing 'title'"
+      ((spec_errors++))
+    fi
+
+    # Required: passes (boolean)
+    if [[ -z "$passes" ]]; then
+      [[ "$quiet" != true ]] && echo -e "  ${RED}✗${NC} $name: Missing 'passes'"
+      ((spec_errors++))
+    elif [[ "$passes" != "true" ]] && [[ "$passes" != "false" ]]; then
+      [[ "$quiet" != true ]] && echo -e "  ${RED}✗${NC} $name: 'passes' must be true or false (got: $passes)"
+      ((spec_errors++))
+    fi
+
+    # Enum: priority (high | medium | low)
+    if [[ -n "$priority" ]] && [[ ! "$priority" =~ ^(high|medium|low)$ ]]; then
+      [[ "$quiet" != true ]] && echo -e "  ${RED}✗${NC} $name: 'priority' must be: high | medium | low (got: $priority)"
+      ((spec_errors++))
+    fi
+
+    # Enum: risk (spike | integration | standard | polish)
+    if [[ -n "$risk" ]] && [[ ! "$risk" =~ ^(spike|integration|standard|polish)$ ]]; then
+      [[ "$quiet" != true ]] && echo -e "  ${RED}✗${NC} $name: 'risk' must be: spike | integration | standard | polish (got: $risk)"
+      ((spec_errors++))
+    fi
+
+    # Optional but validated: created (YYYY-MM-DD format)
+    if [[ -n "$created" ]] && [[ ! "$created" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      [[ "$quiet" != true ]] && echo -e "  ${YELLOW}⚠${NC} $name: 'created' should be YYYY-MM-DD format (got: $created)"
+      ((spec_warnings++))
+    fi
+
+    if [[ $spec_errors -eq 0 ]]; then
+      if [[ "$quiet" != true ]]; then
+        if [[ $spec_warnings -gt 0 ]]; then
+          echo -e "  ${YELLOW}⚠${NC} $name (with warnings)"
+        else
+          echo -e "  ${GREEN}✓${NC} $name"
+        fi
+      fi
+    else
       ((errors++))
-    else
-      echo "  ✓ Valid"
     fi
+    ((warnings += spec_warnings))
   done
 
-  echo ""
-  if [ $errors -eq 0 ]; then
-    echo "✓ All $total specs are valid"
-  else
-    echo "✗ $errors of $total specs have errors"
-    exit 1
-  fi
-}
-
-# ============================================================================
-# COMMAND: run
-# ============================================================================
-
-cmd_run() {
-  local iterations="${1:-10}"
-
-  if ! [[ "$iterations" =~ ^[0-9]+$ ]]; then
-    echo "Error: iterations must be a number"
-    echo "Usage: ./baldrick run [n]"
-    exit 1
-  fi
-
-  local LOG_FILE="$LOG_DIR/baldrick-$(date '+%Y%m%d-%H%M%S').log"
-  local DONE_FILE=".baldrick-done"
-  mkdir -p "$LOG_DIR"
-
-  local START_TIME=$(date +%s)
-  local COMPLETED=0
-  local LAST_STATE_HASH=""
-  local STUCK_COUNT=0
-
-  # Clean up any previous done file
-  rm -f "$DONE_FILE"
-
-  show_run_summary() {
-    local end_time=$(date +%s)
-    local elapsed=$((end_time - START_TIME))
-    echo ""
-    echo "════════════════════════════════════════"
-    echo "SUMMARY"
-    echo "════════════════════════════════════════"
-    echo "Iterations: $COMPLETED"
-    echo "Time: $((elapsed / 60))m $((elapsed % 60))s"
-    echo "Log: $LOG_FILE"
-    echo "════════════════════════════════════════"
-  }
-
-  # Get hash of current state to detect stuck iterations
-  get_state_hash() {
-    if [ -f "$FEATURES_FILE" ]; then
-      md5sum "$FEATURES_FILE" 2>/dev/null | cut -d' ' -f1 || md5 -q "$FEATURES_FILE" 2>/dev/null
-    elif [ -d "$SPECS_DIR" ]; then
-      cat "$SPECS_DIR"/*.md 2>/dev/null | md5sum 2>/dev/null | cut -d' ' -f1 || cat "$SPECS_DIR"/*.md 2>/dev/null | md5 -q 2>/dev/null
-    fi
-  }
-
-  trap 'echo ""; echo "Interrupted!"; rm -f "$DONE_FILE"; show_run_summary; exit 130' INT
-
-  echo ""
-  echo "╔════════════════════════════════════════╗"
-  echo "║      baldrick run - Execution          ║"
-  echo "╠════════════════════════════════════════╣"
-  echo "║ Log: $LOG_FILE"
-  echo "╚════════════════════════════════════════╝"
-  echo ""
-
-  # Determine mode: simple (JSON) or detailed (specs)
-  local MODE="simple"
-  local CONTEXT_FILES=""
-
-  if [ -f "$FEATURES_FILE" ]; then
-    MODE="simple"
-    CONTEXT_FILES="@${FEATURES_FILE}"
-    echo "Mode: Simple (baldrick-features.json)"
-  elif [ -d "$SPECS_DIR" ] && [ -n "$(ls -A "$SPECS_DIR"/*.md 2>/dev/null)" ]; then
-    MODE="detailed"
-    CONTEXT_FILES=""
-    for spec in "$SPECS_DIR"/*.md; do
-      [ -f "$spec" ] || continue
-      [[ "$(basename "$spec")" == _* ]] && continue
-      CONTEXT_FILES="$CONTEXT_FILES @$spec"
-    done
-    echo "Mode: Detailed (spec files)"
-  else
-    echo "No features found. Run './baldrick init' first."
-    exit 1
-  fi
-
-  echo ""
-
-  for ((i=1; i<=$iterations; i++)); do
-    # Check for done file (agent-driven completion)
-    if [ -f "$DONE_FILE" ]; then
-      echo ""
-      echo "All features complete! (.baldrick-done created)"
-      rm -f "$DONE_FILE"
-      show_run_summary
-      exit 0
-    fi
-
-    # Determine role: Worker or Reviewer (every 5th iteration)
-    local ROLE="Worker"
-    local ROLE_INSTRUCTIONS=""
-    if [ $((i % 5)) -eq 0 ]; then
-      ROLE="Reviewer"
-      ROLE_INSTRUCTIONS="
-
-## REVIEWER MODE (Iteration $i)
-Before implementing anything new, REVIEW the current state:
-1. Check progress.txt - are we on track?
-2. Check completed features - do they actually work?
-3. Run tests to verify previous work: ${TEST_CMD}
-4. If issues found, fix them before moving on.
-5. If stuck on same problem 2+ iterations, try a different approach.
-Only after review, continue with implementation if needed."
-    fi
-
-    echo "========================================"
-    echo "Iteration $i/$iterations - $(date '+%H:%M:%S') [$ROLE]"
-    echo "========================================"
-
-    # Check for stuck iterations (same state hash)
-    local CURRENT_HASH=$(get_state_hash)
-    if [ "$CURRENT_HASH" = "$LAST_STATE_HASH" ] && [ -n "$LAST_STATE_HASH" ]; then
-      ((STUCK_COUNT++))
-      if [ $STUCK_COUNT -ge 2 ]; then
-        echo "⚠ WARNING: Stuck for $STUCK_COUNT iterations - no state change detected"
-      fi
-    else
-      STUCK_COUNT=0
-      LAST_STATE_HASH="$CURRENT_HASH"
-    fi
-
-    # Log iteration with timestamp
-    echo "" >> "$LOG_FILE"
-    echo "## Iteration $i - $(date '+%Y-%m-%d %H:%M:%S') [$ROLE]" >> "$LOG_FILE"
-
-    local STUCK_WARNING=""
-    if [ $STUCK_COUNT -ge 2 ]; then
-      STUCK_WARNING="
-
-## ⚠ STUCK DETECTION
-No progress detected for $STUCK_COUNT iterations. Try a DIFFERENT approach:
-- If blocked by a bug, add debugging/logging first
-- If tests fail, read the error carefully and fix root cause
-- If unclear requirements, make a reasonable assumption and document it
-- Consider if the current approach is wrong and needs redesign"
-    fi
-
-    # Include learnings file if it exists
-    local LEARNINGS_CONTEXT=""
-    [ -f "$LEARNINGS_FILE" ] && LEARNINGS_CONTEXT="@${LEARNINGS_FILE}"
-
-    local result
-    result=$(claude --permission-mode acceptEdits -p "$CONTEXT_FILES @${PROGRESS_FILE} $LEARNINGS_CONTEXT
-$ROLE_INSTRUCTIONS
-$STUCK_WARNING
-
-## Instructions
-
-1. Read baldrick-learnings.md first for codebase patterns and gotchas.
-2. Find the first incomplete feature (passes: false) and work ONLY on that feature.
-3. Implement the feature fully following any BDD scenarios or steps provided.
-4. Run these commands and PASTE THE OUTPUT as evidence:
-   - Build: ${BUILD_CMD}
-   - Test: ${TEST_CMD}
-   - Lint: ${LINT_CMD}
-5. Update the feature to passes: true (in JSON or YAML frontmatter).
-6. Append structured progress to progress.txt:
-   \`\`\`
-   ## $(date '+%Y-%m-%d %H:%M') - [Feature Name]
-   - What was done: ...
-   - Test output: (paste actual output)
-   - Next: ...
-   \`\`\`
-7. If you discovered a REUSABLE pattern or gotcha, add it to baldrick-learnings.md.
-8. Make a git commit for this feature.
-
-ONLY WORK ON A SINGLE FEATURE PER ITERATION.
-
-When ALL features are complete (all passes: true):
-1. Run final verification: ${TEST_CMD}
-2. Create done marker: touch $DONE_FILE
-3. Output <promise>COMPLETE</promise>" 2>&1) || {
-      echo "ERROR: Claude failed on iteration $i"
-      show_run_summary
-      exit 1
-    }
-
-    echo "$result" >> "$LOG_FILE"
-    COMPLETED=$i
-
-    # Check for completion (file-based or output-based)
-    if [ -f "$DONE_FILE" ] || [[ "$result" == *"<promise>COMPLETE</promise>"* ]]; then
-      echo ""
-      echo "All features complete!"
-      rm -f "$DONE_FILE"
-      show_run_summary
-      exit 0
-    fi
-
-    echo ""
-  done
-
-  echo "Completed $iterations iterations"
-  rm -f "$DONE_FILE"
-  show_run_summary
-}
-
-# ============================================================================
-# COMMAND: once
-# ============================================================================
-
-cmd_once() {
-  local MAX_ITERATIONS=30
-  local SPEC_ARG=""
-
-  while [[ $# -gt 0 ]]; do
-    case $1 in
-      --max-iterations|--max) MAX_ITERATIONS="$2"; shift 2 ;;
-      -h|--help)
-        echo "Usage: ./baldrick once <spec-name> [--max n]"
-        echo "  --max n    Maximum iterations (default: 30)"
-        exit 0
-        ;;
-      *)
-        if [ -z "$SPEC_ARG" ]; then SPEC_ARG="$1"
-        else echo "Unknown option: $1"; exit 1
-        fi
-        shift
-        ;;
-    esac
-  done
-
-  if [ -z "$SPEC_ARG" ]; then
-    echo "Error: spec name required"
-    echo "Usage: ./baldrick once <spec-name>"
-    exit 1
-  fi
-
-  local SPEC_FILE="$SPECS_DIR/${SPEC_ARG}.md"
-  [[ "$SPEC_ARG" == *.md ]] && SPEC_FILE="$SPECS_DIR/$SPEC_ARG"
-
-  if [ ! -f "$SPEC_FILE" ]; then
-    echo "ERROR: Spec not found: $SPEC_FILE"
-    exit 1
-  fi
-
-  local SPEC_NAME=$(basename "$SPEC_FILE" .md)
-  local LOG_FILE="$LOG_DIR/baldrick-once-${SPEC_NAME}-$(date '+%Y%m%d-%H%M%S').log"
-  local DONE_FILE=".baldrick-done-${SPEC_NAME}"
-  mkdir -p "$LOG_DIR"
-
-  # Clean up any previous done file
-  rm -f "$DONE_FILE"
-
-  local START_TIME=$(date +%s)
-  local COMPLETED=0
-  local LAST_SPEC_HASH=""
-  local STUCK_COUNT=0
-
-  # Get hash of spec file to detect stuck iterations
-  get_spec_hash() {
-    md5sum "$SPEC_FILE" 2>/dev/null | cut -d' ' -f1 || md5 -q "$SPEC_FILE" 2>/dev/null
-  }
-
-  echo "========================================"
-  echo "baldrick once - $SPEC_NAME"
-  echo "========================================"
-  echo "Max iterations: $MAX_ITERATIONS"
-  echo ""
-
-  trap 'echo "Interrupted after $COMPLETED iterations"; rm -f "$DONE_FILE"; exit 130' INT
-
-  for ((i=1; i<=$MAX_ITERATIONS; i++)); do
-    # Check for done file
-    if [ -f "$DONE_FILE" ]; then
-      echo "COMPLETE: $SPEC_NAME (.baldrick-done created)"
-      rm -f "$DONE_FILE"
-      exit 0
-    fi
-
-    # Determine role: Worker or Reviewer (every 5th iteration)
-    local ROLE="Worker"
-    local ROLE_INSTRUCTIONS=""
-    if [ $((i % 5)) -eq 0 ]; then
-      ROLE="Reviewer"
-      ROLE_INSTRUCTIONS="
-
-## REVIEWER MODE (Iteration $i)
-Before implementing anything new, REVIEW the current state:
-1. Check what's been done so far - does it match the spec?
-2. Run tests to verify: ${TEST_CMD}
-3. If issues found, fix them before moving on.
-4. If stuck on same problem 2+ iterations, try a DIFFERENT approach."
-    fi
-
-    echo "[$SPEC_NAME] Iteration $i/$MAX_ITERATIONS [$ROLE]"
-
-    # Check for stuck iterations
-    local CURRENT_HASH=$(get_spec_hash)
-    if [ "$CURRENT_HASH" = "$LAST_SPEC_HASH" ] && [ -n "$LAST_SPEC_HASH" ]; then
-      ((STUCK_COUNT++))
-      if [ $STUCK_COUNT -ge 2 ]; then
-        echo "⚠ WARNING: Stuck for $STUCK_COUNT iterations"
-      fi
-    else
-      STUCK_COUNT=0
-      LAST_SPEC_HASH="$CURRENT_HASH"
-    fi
-
-    local STUCK_WARNING=""
-    if [ $STUCK_COUNT -ge 2 ]; then
-      STUCK_WARNING="
-
-## ⚠ STUCK DETECTION
-No progress for $STUCK_COUNT iterations. Try a DIFFERENT approach:
-- Add debugging/logging to understand the issue
-- Read error messages carefully
-- Consider if current approach is fundamentally wrong
-- If truly blocked, output <promise>BLOCKED</promise> with explanation"
-    fi
-
-    # Include learnings file if it exists
-    local LEARNINGS_CONTEXT=""
-    [ -f "$LEARNINGS_FILE" ] && LEARNINGS_CONTEXT="@${LEARNINGS_FILE}"
-
-    local result
-    result=$(claude --permission-mode acceptEdits -p "@${SPEC_FILE} @${PROGRESS_FILE} $LEARNINGS_CONTEXT
-$ROLE_INSTRUCTIONS
-$STUCK_WARNING
-
-## Instructions
-
-Implement this feature specification: $SPEC_NAME
-
-1. Read baldrick-learnings.md first for codebase patterns and gotchas.
-2. Read the spec completely.
-3. Implement the feature following BDD scenarios exactly.
-4. Run these commands and PASTE THE OUTPUT as evidence:
-   - Build: ${BUILD_CMD}
-   - Test: ${TEST_CMD}
-   - Lint: ${LINT_CMD}
-5. When complete, update frontmatter: passes: true
-6. Append structured progress to progress.txt:
-   \`\`\`
-   ## $(date '+%Y-%m-%d %H:%M') - $SPEC_NAME
-   - What was done: ...
-   - Test output: (paste actual output)
-   - Status: ...
-   \`\`\`
-7. If you discovered a REUSABLE pattern or gotcha, add it to baldrick-learnings.md.
-8. Make a git commit.
-
-When COMPLETE:
-1. Run final verification: ${TEST_CMD}
-2. Create done marker: touch $DONE_FILE
-3. Output <promise>COMPLETE</promise>
-
-If BLOCKED (truly cannot proceed):
-Output <promise>BLOCKED</promise> with explanation.
-
-Work ONLY on this spec." 2>&1) || {
-      echo "ERROR: Claude failed"
-      rm -f "$DONE_FILE"
-      exit 1
-    }
-
-    echo "$result" >> "$LOG_FILE"
-    COMPLETED=$i
-
-    if [ -f "$DONE_FILE" ] || [[ "$result" == *"<promise>COMPLETE</promise>"* ]]; then
-      echo "COMPLETE: $SPEC_NAME"
-      rm -f "$DONE_FILE"
-      exit 0
-    fi
-
-    if [[ "$result" == *"<promise>BLOCKED</promise>"* ]]; then
-      echo "BLOCKED: $SPEC_NAME - check progress.txt"
-      rm -f "$DONE_FILE"
-      exit 1
-    fi
-  done
-
-  echo "Max iterations reached for $SPEC_NAME"
-  rm -f "$DONE_FILE"
-  exit 1
-}
-
-# ============================================================================
-# COMMAND: create
-# ============================================================================
-
-cmd_create() {
-  local FEATURE_NAME=""
-  local DESCRIPTION=""
-  local DETAILED=false
-  local VIBE=false
-
-  while [[ $# -gt 0 ]]; do
-    case $1 in
-      --detailed) DETAILED=true; shift ;;
-      --vibe) VIBE=true; shift ;;
-      -h|--help)
-        echo "Usage: ./baldrick create <name> [--detailed] [--vibe] [description]"
-        echo "  --detailed   Create comprehensive spec with mermaid/ASCII"
-        echo "  --vibe       Skip questions, generate with sensible defaults"
-        exit 0
-        ;;
-      *)
-        if [ -z "$FEATURE_NAME" ]; then FEATURE_NAME="$1"
-        else DESCRIPTION="$1"
-        fi
-        shift
-        ;;
-    esac
-  done
-
-  if [ -z "$FEATURE_NAME" ]; then
-    echo "Error: feature name required"
-    exit 1
-  fi
-
-  local SPEC_FILE="$SPECS_DIR/${FEATURE_NAME}.md"
-  local TODAY=$(date '+%Y-%m-%d')
-
-  if [ -f "$SPEC_FILE" ]; then
-    echo "ERROR: Spec already exists: $SPEC_FILE"
-    exit 1
-  fi
-
-  mkdir -p "$SPECS_DIR"
-
-  local FEATURE_TITLE=$(echo "$FEATURE_NAME" | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1')
-
-  echo "========================================"
-  echo "baldrick create: $FEATURE_TITLE"
-  echo "========================================"
-
-  if [ -z "$DESCRIPTION" ]; then
-    echo "Describe this feature:"
-    read -p "> " DESCRIPTION
-  fi
-
-  [ -z "$DESCRIPTION" ] && { echo "ERROR: Description required."; exit 1; }
-
-  local TEMPLATE_FILE="$TEMPLATES_DIR/detailed/feature.md"
-  [ "$DETAILED" = true ] && TEMPLATE_FILE="$TEMPLATES_DIR/detailed/feature-detailed.md"
-
-  local TEMPLATE_CONTEXT=""
-  [ -f "$TEMPLATE_FILE" ] && TEMPLATE_CONTEXT="Follow this template structure:
-@$TEMPLATE_FILE"
-
-  local MODE_INSTRUCTIONS
-  if [ "$DETAILED" = true ]; then
-    MODE_INSTRUCTIONS="Create a COMPREHENSIVE spec with:
-- Mermaid flowchart showing the process
-- ASCII diagram as alternative visualization
-- In Scope / Out of Scope boundaries
-- Dependencies checklist
-- Example tables with REAL data (not placeholders)
-- Multiple Gherkin scenarios (happy path, edge cases, errors)
-- Files section showing where code should go
-- Done When checklist with specific, testable criteria"
-  else
-    MODE_INSTRUCTIONS="Create a FOCUSED spec with:
-- In Scope / Out of Scope boundaries
-- Example table with REAL data (not placeholders)
-- Gherkin scenarios (happy path + error case)
-- Done When checklist with specific criteria"
-  fi
-
-  local PROCESS_INSTRUCTIONS
-  if [ "$VIBE" = true ]; then
-    echo "Generating spec (vibe mode - no questions)..."
-    PROCESS_INSTRUCTIONS="## Process
-
-1. Make sensible assumptions based on common patterns for this type of feature.
-2. Generate the spec immediately with YAML frontmatter:
-\`\`\`yaml
----
-title: \"$FEATURE_TITLE\"
-passes: false
-created: $TODAY
----
-\`\`\`
-3. Write to: $SPEC_FILE
-
-Do NOT ask questions. Just generate a solid spec with reasonable defaults."
-  else
-    echo "Generating spec..."
-    PROCESS_INSTRUCTIONS="## Process
-
-1. First, use the AskUserQuestion tool to ask 2-3 clarifying questions about:
-   - Primary success scenario
-   - Key edge cases to handle
-   - Error conditions
-
-2. After getting answers, generate the spec with YAML frontmatter:
-\`\`\`yaml
----
-title: \"$FEATURE_TITLE\"
-passes: false
-created: $TODAY
----
-\`\`\`
-3. Write to: $SPEC_FILE"
-  fi
-
-  claude --permission-mode acceptEdits -p "
-Generate a feature specification for: $FEATURE_TITLE
-
-## User's Description
-$DESCRIPTION
-
-## CRITICAL REQUIREMENTS
-
-1. **Be CONCRETE, not abstract:**
-   - Use real example data: \`alice@example.com\` not \`[email]\`
-   - Use real values: \`{id: 1, name: \"Test\"}\` not \`[response]\`
-   - Specify actual error messages, HTTP codes, file paths
-
-2. **Define clear boundaries:**
-   - What's IN scope (we ARE building this)
-   - What's OUT of scope (we are NOT building this)
-
-3. **Write testable Gherkin:**
-   - Use concrete values in Given/When/Then
-   - Include expected HTTP status codes
-   - Include expected response shapes
-
-4. **Create checkable Done When:**
-   - Each item must be verifiable
-   - Include build/test commands
-   - Include manual verification step
-
-## Instructions
-$MODE_INSTRUCTIONS
-
-$TEMPLATE_CONTEXT
-
-$PROCESS_INSTRUCTIONS
-
-Remember: The spec should be so clear that an AI can implement it without asking questions.
-"
-
-  if [ -f "$SPEC_FILE" ]; then
-    echo ""
-    echo "CREATED: $SPEC_FILE"
-
-    # Create feature branch if in git repo
-    if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
-      local BRANCH_NAME="baldrick/${FEATURE_NAME}"
-      local CURRENT_BRANCH=$(git branch --show-current)
-
-      if [ "$CURRENT_BRANCH" != "$BRANCH_NAME" ]; then
-        echo ""
-        read -p "Create branch '$BRANCH_NAME'? [Y/n] " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
-          git checkout -b "$BRANCH_NAME" 2>/dev/null || git checkout "$BRANCH_NAME"
-          # Add branch to spec frontmatter
-          sed -i.bak "s/^passes: false/passes: false\nbranch: \"$BRANCH_NAME\"/" "$SPEC_FILE" && rm -f "${SPEC_FILE}.bak"
-          echo "✓ On branch: $BRANCH_NAME"
-        fi
+  [[ "$quiet" != true ]] && echo ""
+  if [[ $errors -eq 0 ]]; then
+    if [[ "$quiet" != true ]]; then
+      if [[ $warnings -gt 0 ]]; then
+        echo -e "${GREEN}All $total specs valid${NC} (${YELLOW}$warnings warning(s)${NC})"
+      else
+        echo -e "${GREEN}All $total specs valid${NC}"
       fi
     fi
-
-    echo ""
-    echo "Next: ./baldrick run 10"
+    return 0
   else
-    echo ""
-    echo "Spec was not created."
-    echo ""
-    echo "If Claude asked questions, answer them and the spec will be generated."
-    echo "Or create the spec manually: specs/${FEATURE_NAME}.md"
-    exit 1
+    [[ "$quiet" != true ]] && echo -e "${RED}$errors of $total specs have errors${NC}"
+    return 1
   fi
 }
 
-# ============================================================================
-# COMMAND: docs
-# ============================================================================
 
-cmd_docs() {
-  local SPEC_NAME=""
+# =============================================================================
+# COMMAND: doctor
+# =============================================================================
 
-  while [[ $# -gt 0 ]]; do
-    case $1 in
-      -h|--help)
-        echo "Usage: ./baldrick docs <spec-name>"
-        exit 0
-        ;;
-      *) SPEC_NAME="$1"; shift ;;
-    esac
-  done
+cmd_doctor() {
+  echo ""
+  echo -e "${BOLD}baldrick doctor${NC} - Configuration Check"
+  echo ""
 
-  [ -z "$SPEC_NAME" ] && { echo "Error: spec name required"; exit 1; }
+  local errors=0 warnings=0
 
-  local SPEC_FILE="$SPECS_DIR/${SPEC_NAME}.md"
-  [[ "$SPEC_NAME" == *.md ]] && SPEC_FILE="$SPECS_DIR/$SPEC_NAME" && SPEC_NAME="${SPEC_NAME%.md}"
+  # Check Claude CLI
+  if command -v "$CLAUDE_RUNNER" >/dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC} Claude CLI found: $CLAUDE_RUNNER"
+  else
+    echo -e "${RED}✗${NC} Claude CLI not found: $CLAUDE_RUNNER"
+    echo "  Install: https://docs.anthropic.com/claude-code"
+    ((errors++))
+  fi
 
-  [ ! -f "$SPEC_FILE" ] && { echo "ERROR: Spec not found: $SPEC_FILE"; exit 1; }
+  # Check build/test/lint commands
+  [[ -n "$BUILD_CMD" ]] && echo -e "${GREEN}✓${NC} BUILD_CMD: $BUILD_CMD" || { echo -e "${YELLOW}⚠${NC} BUILD_CMD not set"; ((warnings++)); }
+  [[ -n "$TEST_CMD" ]] && echo -e "${GREEN}✓${NC} TEST_CMD: $TEST_CMD" || { echo -e "${YELLOW}⚠${NC} TEST_CMD not set"; ((warnings++)); }
+  [[ -n "$LINT_CMD" ]] && echo -e "${GREEN}✓${NC} LINT_CMD: $LINT_CMD" || { echo -e "${YELLOW}⚠${NC} LINT_CMD not set"; ((warnings++)); }
 
-  mkdir -p "$DOCS_DIR"
-  local OUTPUT_FILE="$DOCS_DIR/${SPEC_NAME}-changes.md"
-  local TODAY=$(date '+%Y-%m-%d')
+  echo -e "${GREEN}✓${NC} QUALITY_TIER: $QUALITY_TIER"
+  echo -e "${GREEN}✓${NC} REVIEW_EVERY: $REVIEW_EVERY"
 
-  local GIT_DIFF="" GIT_STATS=""
+  if [[ -n "$NOTIFY_CMD" ]]; then
+    echo -e "${GREEN}✓${NC} NOTIFY_CMD: ${NOTIFY_CMD:0:40}..."
+  else
+    echo -e "${DIM}○${NC} NOTIFY_CMD not set (optional)"
+  fi
+
+  # Check directories
+  if [[ -d "$SPECS_DIR" ]]; then
+    local spec_count
+    spec_count=$(ls -1 "$SPECS_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
+    echo -e "${GREEN}✓${NC} specs/ exists ($spec_count specs)"
+  else
+    echo -e "${YELLOW}⚠${NC} specs/ not found - run 'baldrick init'"
+    ((warnings++))
+  fi
+
+  [[ -d "$LOG_DIR" ]] && echo -e "${GREEN}✓${NC} logs/ exists" || echo -e "${DIM}○${NC} logs/ will be created on first run"
+  [[ -f "$PROGRESS_FILE" ]] && echo -e "${GREEN}✓${NC} progress.txt exists" || { echo -e "${YELLOW}⚠${NC} progress.txt not found - run 'baldrick init'"; ((warnings++)); }
+  [[ -f "$LEARNINGS_FILE" ]] && echo -e "${GREEN}✓${NC} baldrick-learnings.md exists" || echo -e "${DIM}○${NC} baldrick-learnings.md will be created on init"
+
+  # Check git
   if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
-    GIT_DIFF=$(git diff HEAD --no-color 2>/dev/null | head -500 || echo "")
-    GIT_STATS=$(git diff HEAD --stat --no-color 2>/dev/null || echo "")
+    echo -e "${GREEN}✓${NC} Git repository detected"
+  else
+    echo -e "${YELLOW}⚠${NC} Not a git repository - commits won't work"
+    ((warnings++))
   fi
 
-  echo "Generating docs for: $SPEC_NAME"
+  # Validate specs if they exist
+  if [[ -d "$SPECS_DIR" ]] && [[ -n "$(ls -A "$SPECS_DIR"/*.md 2>/dev/null)" ]]; then
+    echo ""
+    echo -e "${BOLD}Spec Validation:${NC}"
+    local spec_errors=0
+    for spec in "$SPECS_DIR"/*.md; do
+      [[ -f "$spec" ]] || continue
+      [[ "$(basename "$spec")" == _* ]] && continue
+      local name
+      name=$(basename "$spec" .md)
+      local title passes
+      title=$(extract_field "$spec" "title")
+      passes=$(extract_field "$spec" "passes")
+      if [[ -n "$title" ]] && [[ -n "$passes" ]]; then
+        echo -e "  ${GREEN}✓${NC} $name"
+      else
+        echo -e "  ${RED}✗${NC} $name - run 'baldrick validate' for details"
+        ((spec_errors++))
+      fi
+    done
+    [[ $spec_errors -gt 0 ]] && ((errors += spec_errors))
+  fi
 
-  claude --permission-mode acceptEdits -p "
-Generate change documentation for: $SPEC_NAME
-
-## Spec
-@$SPEC_FILE
-
-## Git Changes
-\`\`\`
-$GIT_STATS
-\`\`\`
-
-## Diff (truncated)
-\`\`\`diff
-$GIT_DIFF
-\`\`\`
-
-Write a PR-ready change document to: $OUTPUT_FILE
-
-Include: summary, files changed, implementation decisions, BDD coverage.
-"
-
-  [ -f "$OUTPUT_FILE" ] && echo "CREATED: $OUTPUT_FILE" || { echo "ERROR: Docs not created."; exit 1; }
+  # Summary
+  echo ""
+  if [[ $errors -eq 0 ]] && [[ $warnings -eq 0 ]]; then
+    echo -e "${GREEN}All checks passed!${NC} Ready to run."
+  elif [[ $errors -eq 0 ]]; then
+    echo -e "${YELLOW}$warnings warning(s)${NC} - baldrick can run but may have issues"
+  else
+    echo -e "${RED}$errors error(s)${NC} - please fix before running"
+    exit 1
+  fi
 }
 
-# ============================================================================
-# COMMAND: vibe (shortcut for create --vibe)
-# ============================================================================
 
-cmd_vibe() {
-  cmd_create --vibe "$@"
+# =============================================================================
+# MAIN DISPATCHER
+# =============================================================================
+
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    # Execution
+    run|r)         cmd_run "$@" ;;
+    once)          cmd_once "$@" ;;
+
+    # Status
+    status|s|list) cmd_status ;;
+    validate|v)    cmd_validate ;;
+
+    # Utilities
+    init)          cmd_init ;;
+    archive)       cmd_archive "$@" ;;
+    doctor)        cmd_doctor ;;
+
+    # Meta
+    help|-h|--help) cmd_help ;;
+    --version|-V)   echo "baldrick v$VERSION" ;;
+
+    # Unknown
+    *)
+      echo -e "${RED}Unknown:${NC} $cmd"
+      echo ""
+      cmd_help
+      exit 1
+      ;;
+  esac
 }
 
-# ============================================================================
-# COMMAND: spec (shortcut for create --detailed)
-# ============================================================================
+# =============================================================================
+# MAIN GUARD - allows sourcing for testing
+# =============================================================================
 
-cmd_spec() {
-  cmd_create --detailed "$@"
-}
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-case "${1:-}" in
-  init) shift; cmd_init "$@" ;;
-  run) shift; cmd_run "$@" ;;
-  once) shift; cmd_once "$@" ;;
-  create) shift; cmd_create "$@" ;;
-  vibe) shift; cmd_vibe "$@" ;;
-  spec) shift; cmd_spec "$@" ;;
-  docs) shift; cmd_docs "$@" ;;
-  status|list) shift; cmd_status "$@" ;;
-  validate) shift; cmd_validate "$@" ;;
-  help|-h|--help) cmd_help ;;
-  --version|-v) echo "baldrick v$VERSION" ;;
-  "") cmd_help ;;
-  *) echo "Unknown command: $1"; cmd_help; exit 1 ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

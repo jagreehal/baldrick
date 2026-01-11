@@ -1,6 +1,18 @@
-docs
-logs
-node_modules
-specs
-templates
+# Runtime files
+.last-session
+.baldrick-*
 progress.txt
+
+# Generated directories
+docs/
+logs/
+archive/
+
+# Project-specific (created by init)
+specs/
+
+# Dependencies
+node_modules/
+
+# Test/dev files
+___*
