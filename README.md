@@ -1,10 +1,29 @@
 # baldrick
 
+**Autonomous AI coding loops that actually finish.**
+
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Works With](https://img.shields.io/badge/works%20with-Node%20%7C%20Python%20%7C%20Go-orange)
+![Zero Dependencies](https://img.shields.io/badge/zero%20dependencies-%E2%9C%94-green)
+
 ![Baldrick](baldrick.png)
 
 > *"I have a cunning plan!"* - Baldrick, Blackadder
 
-Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) same loop concept, you define what "done" looks like and runs Claude repeatedly until it gets there, with added structure:
+## Quick Start
+
+```bash
+curl -sO https://raw.githubusercontent.com/jagreehal/baldrick/main/baldrick && chmod +x baldrick && ./baldrick init
+```
+
+Create a spec, run `./baldrick run 5`, watch Claude implement it.
+
+---
+
+## What Is This?
+
+Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) — define what "done" looks like, run Claude repeatedly until it gets there. Baldrick adds structure:
 
 - **Deterministic selection** — bash picks tasks mechanically (priority/risk), prevents AI from skipping hard work
 - **Redundant completion** — 3 signals must agree (done file + token + all specs pass), prevents false victories
@@ -14,20 +33,19 @@ Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) same lo
 
 See [design.md](design.md) for the full philosophy.
 
+---
+
 ## Why Loops Work
 
 Every AI coding session accumulates context: files read, commands run, wrong turns taken, half-baked plans. You can add but can't delete. Eventually it starts repeating itself, "fixing" the same bug different ways, confidently undoing its own work. That's **context pollution**.
 
 Baldrick doesn't try to clean the context. It throws it away and starts fresh. Progress persists in files (specs, progress.txt, git). Failures evaporate with the session. Each iteration reconstructs reality from the filesystem, not chat history.
 
-```bash
-# Install (one file, no dependencies)
-curl -O https://raw.githubusercontent.com/jagreehal/baldrick/main/baldrick
-chmod +x baldrick
-./baldrick init
-```
+---
 
-This creates:
+## Getting Started
+
+After running `./baldrick init`, you'll have:
 
 ```text
 specs/                  # Your feature specs go here
@@ -55,7 +73,7 @@ passes: false
 EOF
 ```
 
-> For better results see templates (see [Spec Templates](#spec-templates))
+> For better results, see [Spec Templates](#spec-templates)
 
 `passes: true` means the spec's Done When criteria are met **and** quality gates (build/test/lint) are green.
 
@@ -116,13 +134,14 @@ Each iteration rebuilds context from files (specs + progress + learnings), not c
 # Status
 ./baldrick status                 # Show specs and progress
 ./baldrick validate               # Check specs for errors
+./baldrick doctor                 # Check configuration
 
 # Utilities
 ./baldrick init                   # Setup project structure
 ./baldrick archive                # Archive current session
 ./baldrick archive list           # List archived sessions
 ./baldrick archive restore <name> # Restore archived session
-./baldrick doctor                 # Check configuration
+./baldrick --version              # Show version
 ```
 
 **Aliases:** `s` → status, `r` → run, `v` → validate
@@ -155,6 +174,7 @@ Set these environment variables to customize baldrick:
 | `LINT_CMD` | `npm run lint` | Lint command |
 | `QUALITY_TIER` | `production` | Hint to Claude: prototype (speed) / production (robust) / library (API stability) |
 | `REVIEW_EVERY` | `5` | Reviewer mode every N iterations |
+| `CLAUDE_TIMEOUT` | `300` | Max seconds per Claude call (prevents hung loops) |
 | `NOTIFY_CMD` | (none) | Notification webhook |
 
 **For non-Node projects**, set these before running:

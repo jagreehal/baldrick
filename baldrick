@@ -44,6 +44,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Claude runner - injectable for testing
 : "${CLAUDE_RUNNER:=claude}"
 
+# Timeout for Claude sessions (prevents hung loops)
+: "${CLAUDE_TIMEOUT:=300}"  # 5 minutes default
+
 # =============================================================================
 # EMBEDDED AGENT INSTRUCTIONS (no external baldrick-prompt.md needed)
 # =============================================================================
@@ -520,9 +523,14 @@ run_claude() {
   temp=$(mktemp)
 
   start_spinner "Claude is working..."
-  $CLAUDE_RUNNER --permission-mode acceptEdits -p "$prompt" 2>&1 > "$temp"
+  timeout "$CLAUDE_TIMEOUT" $CLAUDE_RUNNER --permission-mode acceptEdits -p "$prompt" 2>&1 > "$temp"
   exit_code=$?
   stop_spinner
+
+  # Handle timeout (exit code 124)
+  if [[ $exit_code -eq 124 ]]; then
+    echo -e "${RED}✗${NC} Claude timed out after ${CLAUDE_TIMEOUT}s"
+  fi
 
   local lines
   lines=$(wc -l < "$temp" | tr -d ' ')
@@ -564,11 +572,12 @@ ${CYAN}Aliases:${NC}
   s → status    r → run    v → validate
 
 ${CYAN}Configuration (env vars):${NC}
-  BUILD_CMD      Build command (default: npm run build)
-  TEST_CMD       Test command (default: npm test)
-  LINT_CMD       Lint command (default: npm run lint)
-  QUALITY_TIER   prototype | production | library
-  REVIEW_EVERY   Reviewer mode cadence (default: 5)
+  BUILD_CMD       Build command (default: npm run build)
+  TEST_CMD        Test command (default: npm test)
+  LINT_CMD        Lint command (default: npm run lint)
+  QUALITY_TIER    prototype | production | library
+  REVIEW_EVERY    Reviewer mode cadence (default: 5)
+  CLAUDE_TIMEOUT  Max seconds per Claude call (default: 300)
 
 ${CYAN}Spec Creation (use Claude Code skills):${NC}
   Load "spec-create" skill for interactive creation
@@ -1518,6 +1527,7 @@ cmd_doctor() {
 
   echo -e "${GREEN}✓${NC} QUALITY_TIER: $QUALITY_TIER"
   echo -e "${GREEN}✓${NC} REVIEW_EVERY: $REVIEW_EVERY"
+  echo -e "${GREEN}✓${NC} CLAUDE_TIMEOUT: ${CLAUDE_TIMEOUT}s"
 
   if [[ -n "$NOTIFY_CMD" ]]; then
     echo -e "${GREEN}✓${NC} NOTIFY_CMD: ${NOTIFY_CMD:0:40}..."
