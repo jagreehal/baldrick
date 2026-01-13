@@ -3,8 +3,7 @@
 .baldrick-*
 progress.txt
 
-# Generated directories
-docs/
+# Generated directories (runtime)
 logs/
 archive/
 
