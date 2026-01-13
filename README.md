@@ -2,7 +2,7 @@
 
 **Autonomous AI coding loops that actually finish.**
 
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Works With](https://img.shields.io/badge/works%20with-Node%20%7C%20Python%20%7C%20Go-orange)
 ![Zero Dependencies](https://img.shields.io/badge/zero%20dependencies-%E2%9C%94-green)
@@ -60,6 +60,12 @@ logs/                   # Iteration logs (auto-created if missing)
 
 Now create a spec. This tells baldrick what "done" looks like:
 
+**Quick way:**
+```bash
+./baldrick new hello --title "Add Hello Function"
+```
+
+**Or manually:**
 ```bash
 cat > specs/hello.md << 'EOF'
 ---
@@ -73,18 +79,25 @@ passes: false
 EOF
 ```
 
-> For better results, see [Spec Templates](#spec-templates)
+> For better results, see [Spec Templates](#spec-templates) or use Claude Code skills (spec-create, spec-vibe, spec-detailed)
 
 `passes: true` means the spec's Done When criteria are met **and** quality gates (build/test/lint) are green.
 
 Run it:
 
 ```bash
-./baldrick run 1     # Run one iteration
-./baldrick status    # Check progress
+./baldrick run 1           # Run one iteration
+./baldrick run 10 --verbose # Run with streaming output
+./baldrick status          # Check progress
 ```
 
 That's it. Claude implements the feature, runs quality gates (build/test/lint), and commits when all checks pass.
+
+**Run options:**
+- `--dry-run` - Show what would run without executing
+- `--verbose` or `-v` - Stream Claude output in real-time (instead of spinner)
+- `--stream=PATH` - Enable TUI event streaming (advanced)
+- `--control=PATH` - Enable TUI control socket (advanced)
 
 ---
 
@@ -128,8 +141,9 @@ Each iteration rebuilds context from files (specs + progress + learnings), not c
 
 ```bash
 # Execution
-./baldrick run [n] [--dry-run]    # Run n iterations (default: 10)
-./baldrick once <name> [--max n]  # Focus on single spec until done
+./baldrick run [n] [--dry-run] [--verbose|-v]    # Run n iterations (default: 10)
+./baldrick once <name> [--max n] [--verbose|-v]  # Focus on single spec until done
+./baldrick tui                                  # Launch interactive TUI
 
 # Status
 ./baldrick status                 # Show specs and progress
@@ -138,13 +152,17 @@ Each iteration rebuilds context from files (specs + progress + learnings), not c
 
 # Utilities
 ./baldrick init                   # Setup project structure
+./baldrick new <name>             # Create new spec interactively
 ./baldrick archive                # Archive current session
 ./baldrick archive list           # List archived sessions
 ./baldrick archive restore <name> # Restore archived session
+./baldrick logs [show|tail|list|activity|clean]  # View iteration logs
+./baldrick skip <spec>            # Temporarily skip a spec
+./baldrick unskip <spec>          # Re-enable a skipped spec
 ./baldrick --version              # Show version
 ```
 
-**Aliases:** `s` → status, `r` → run, `v` → validate
+**Aliases:** `s` → status, `r` → run, `v` → validate, `n` → new, `l` → logs
 
 ---
 
@@ -354,6 +372,22 @@ Load the skill and describe your goal. The skill iterates until complete.
 
 ---
 
+## Interactive TUI
+
+Baldrick includes TUI integration for real-time monitoring and control:
+
+```bash
+./baldrick tui
+```
+
+The TUI provides:
+- Real-time progress updates
+- Pause/resume/stop controls
+- Live log streaming
+- Spec status visualization
+
+Requires `baldrick-tui` to be installed separately.
+
 ## Advanced Setup
 
 ### From Marketplace
@@ -407,6 +441,30 @@ CLAUDE_RUNNER=./mock-claude.sh ./baldrick run 1
 | `baldrick-learnings.md` | Permanent patterns |
 | `logs/baldrick-*.log` | Raw Claude output |
 | `logs/iter-*.json` | Structured iteration data |
+| `logs/activity.log` | Activity audit trail |
+
+### Logs Command
+
+View iteration logs and activity:
+
+```bash
+./baldrick logs              # Show latest Claude output
+./baldrick logs tail          # Follow latest log in real-time
+./baldrick logs list          # List all log files
+./baldrick logs activity      # Show activity audit trail
+./baldrick logs clean         # Remove all log files
+```
+
+### Skip/Unskip Specs
+
+Temporarily exclude specs from selection:
+
+```bash
+./baldrick skip <spec-name>   # Mark spec as blocked
+./baldrick unskip <spec-name>  # Re-enable a skipped spec
+```
+
+Skipped specs are excluded from selection until unskipped. Useful for temporarily blocking specs that need external dependencies or are waiting on other work.
 
 ---
 
