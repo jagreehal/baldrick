@@ -10,7 +10,7 @@ set -eo pipefail
 #   - Claude Code CLI installed and authenticated
 #   - Run /sandbox in Claude Code first for bash auto-allow
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # =============================================================================
@@ -46,6 +46,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Timeout for Claude sessions (prevents hung loops)
 : "${CLAUDE_TIMEOUT:=300}"  # 5 minutes default
+
+# Activity logging
+: "${ACTIVITY_LOG:=$LOG_DIR/activity.log}"
 
 # =============================================================================
 # EMBEDDED AGENT INSTRUCTIONS (no external baldrick-prompt.md needed)
@@ -165,6 +168,53 @@ If truly blocked after multiple attempts:
 PROMPT_EOF
 
 # =============================================================================
+# PROJECT TYPE AUTO-DETECTION
+# =============================================================================
+
+# Track detected project type for doctor output
+DETECTED_PROJECT_TYPE="npm (default)"
+
+detect_project_type() {
+  # Only auto-detect if using default npm commands and no package.json exists
+  # This preserves user's explicit settings while helping non-npm projects
+  if [[ "$BUILD_CMD" == "npm run build" ]] && [[ ! -f "package.json" ]]; then
+    if [[ -f "Makefile" ]]; then
+      DETECTED_PROJECT_TYPE="make"
+      BUILD_CMD="make build 2>/dev/null || make"
+      TEST_CMD="make test 2>/dev/null || true"
+      LINT_CMD="make lint 2>/dev/null || true"
+    elif [[ -f "go.mod" ]]; then
+      DETECTED_PROJECT_TYPE="go"
+      BUILD_CMD="go build ./..."
+      TEST_CMD="go test ./..."
+      LINT_CMD="go vet ./..."
+    elif [[ -f "Cargo.toml" ]]; then
+      DETECTED_PROJECT_TYPE="rust"
+      BUILD_CMD="cargo build"
+      TEST_CMD="cargo test"
+      LINT_CMD="cargo clippy 2>/dev/null || true"
+    elif [[ -f "pyproject.toml" ]] || [[ -f "setup.py" ]] || [[ -f "requirements.txt" ]]; then
+      DETECTED_PROJECT_TYPE="python"
+      BUILD_CMD="python -m py_compile *.py 2>/dev/null || true"
+      TEST_CMD="pytest 2>/dev/null || python -m pytest 2>/dev/null || true"
+      LINT_CMD="ruff check . 2>/dev/null || flake8 2>/dev/null || true"
+    elif [[ -f "mix.exs" ]]; then
+      DETECTED_PROJECT_TYPE="elixir"
+      BUILD_CMD="mix compile"
+      TEST_CMD="mix test"
+      LINT_CMD="mix credo 2>/dev/null || true"
+    else
+      DETECTED_PROJECT_TYPE="none (no build system detected)"
+      BUILD_CMD="true"  # No-op
+      TEST_CMD="true"
+      LINT_CMD="true"
+    fi
+  elif [[ -f "package.json" ]]; then
+    DETECTED_PROJECT_TYPE="npm"
+  fi
+}
+
+# =============================================================================
 # COLORS (testable: can be disabled with NO_COLOR=1)
 # =============================================================================
 
@@ -215,6 +265,17 @@ stop_spinner() {
     printf "\r\033[K"
   fi
 }
+
+# =============================================================================
+# ACTIVITY LOGGING (audit trail)
+# =============================================================================
+
+# Log timestamped activity to audit trail
+log_activity() {
+  mkdir -p "$(dirname "$ACTIVITY_LOG")"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" >> "$ACTIVITY_LOG"
+}
+
 
 # =============================================================================
 # PURE UTILITY FUNCTIONS (no side effects, testable in isolation)
@@ -518,14 +579,23 @@ CLAUDE_RESULT=""
 CLAUDE_EXIT=0
 
 run_claude() {
-  local prompt="$1" log_file="$2"
+  local prompt="$1" log_file="$2" verbose="${3:-false}"
   local temp exit_code
   temp=$(mktemp)
 
-  start_spinner "Claude is working..."
-  timeout "$CLAUDE_TIMEOUT" $CLAUDE_RUNNER --permission-mode acceptEdits -p "$prompt" 2>&1 > "$temp"
-  exit_code=$?
-  stop_spinner
+  if [[ "$verbose" == "true" ]]; then
+    # Verbose mode: stream output in real-time
+    echo -e "${CYAN}─── Claude output ───────────────────────────────────────${NC}"
+    timeout "$CLAUDE_TIMEOUT" $CLAUDE_RUNNER --permission-mode acceptEdits -p "$prompt" 2>&1 | tee "$temp"
+    exit_code=${PIPESTATUS[0]}
+    echo -e "${CYAN}─── End output ──────────────────────────────────────────${NC}"
+  else
+    # Normal mode: spinner with silent execution
+    start_spinner "Claude is working..."
+    timeout "$CLAUDE_TIMEOUT" $CLAUDE_RUNNER --permission-mode acceptEdits -p "$prompt" 2>&1 > "$temp"
+    exit_code=$?
+    stop_spinner
+  fi
 
   # Handle timeout (exit code 124)
   if [[ $exit_code -eq 124 ]]; then
@@ -534,7 +604,7 @@ run_claude() {
 
   local lines
   lines=$(wc -l < "$temp" | tr -d ' ')
-  echo -e "${GREEN}✓${NC} Claude responded ($lines lines)"
+  [[ "$verbose" != "true" ]] && echo -e "${GREEN}✓${NC} Claude responded ($lines lines)"
 
   [[ -n "$log_file" ]] && cat "$temp" >> "$log_file"
   CLAUDE_RESULT=$(cat "$temp")
@@ -564,12 +634,16 @@ ${CYAN}Status:${NC}
 
 ${CYAN}Utilities:${NC}
   init                    Setup templates and directories
+  new <name>              Create new spec interactively
   archive [list|restore]  Manage session archives
   doctor                  Check configuration and dependencies
+  logs [show|tail|list]   View iteration logs
+  skip <spec>             Temporarily skip a spec
+  unskip <spec>           Re-enable a skipped spec
   help                    Show this help
 
 ${CYAN}Aliases:${NC}
-  s → status    r → run    v → validate
+  s → status    r → run    v → validate    n → new    l → logs
 
 ${CYAN}Configuration (env vars):${NC}
   BUILD_CMD       Build command (default: npm run build)
@@ -616,6 +690,12 @@ cmd_status() {
 
   local total=0 complete=0 blocked_count=0
 
+  # Determine next spec for highlighting
+  local next_spec_name=""
+  local next_spec
+  next_spec=$(get_next_spec)
+  [[ -n "$next_spec" ]] && next_spec_name=$(basename "$next_spec" .md)
+
   # Generate spec list with status
   # Temporarily disable errexit for this section (fixes set -e + pipe interaction)
   set +e
@@ -647,29 +727,41 @@ cmd_status() {
 
       echo "${p_order}${r_order}|${status}|${priority}|${risk}|${name}"
     done
-  } | sort | while IFS='|' read -r _ status priority risk name; do
-    [[ -z "$name" ]] && continue
+  } | sort | NEXT_SPEC="$next_spec_name" bash -c '
+    while IFS="|" read -r _ status priority risk name; do
+      [[ -z "$name" ]] && continue
 
-    local emoji="${YELLOW}⭕${NC}"
-    local dim=""
-    case "$status" in
-      done)    emoji="${GREEN}✓${NC}"; dim="${DIM}" ;;
-      blocked) emoji="${RED}🚫${NC}"; dim="${DIM}" ;;
-      pending) emoji="${YELLOW}⭕${NC}" ;;
-    esac
+      # Colors (simplified in subshell)
+      RED="\033[0;31m"; GREEN="\033[0;32m"; YELLOW="\033[1;33m"
+      CYAN="\033[0;36m"; DIM="\033[2m"; NC="\033[0m"
 
-    local pc="" rc=""
-    case "$priority" in
-      high) pc="${RED}" ;; medium) pc="${YELLOW}" ;; low) pc="${DIM}" ;;
-    esac
-    case "$risk" in
-      spike) rc="${RED}" ;; integration) rc="${YELLOW}" ;; polish) rc="${DIM}" ;;
-    esac
+      emoji="${YELLOW}⭕${NC}"
+      dim=""
+      case "$status" in
+        done)    emoji="${GREEN}✓${NC}"; dim="${DIM}" ;;
+        blocked) emoji="${RED}🚫${NC}"; dim="${DIM}" ;;
+        pending) emoji="${YELLOW}⭕${NC}" ;;
+      esac
 
-    [[ ${#name} -gt 28 ]] && name="${name:0:25}..."
-    printf "║ %b │ %b%-8s%b │ %b%-11s%b │ %b%-28s%b ║\n" \
-      "$emoji" "$pc" "$priority" "$NC" "$rc" "$risk" "$NC" "$dim" "$name" "$NC"
-  done
+      pc="" rc=""
+      case "$priority" in
+        high) pc="${RED}" ;; medium) pc="${YELLOW}" ;; low) pc="${DIM}" ;;
+      esac
+      case "$risk" in
+        spike) rc="${RED}" ;; integration) rc="${YELLOW}" ;; polish) rc="${DIM}" ;;
+      esac
+
+      # Next spec indicator
+      next_marker=" "
+      if [[ "$name" == "$NEXT_SPEC" ]]; then
+        next_marker="${CYAN}→${NC}"
+      fi
+
+      [[ ${#name} -gt 28 ]] && name="${name:0:25}..."
+      printf "║%b %b │ %b%-8s%b │ %b%-11s%b │ %b%-28s%b ║\n" \
+        "$next_marker" "$emoji" "$pc" "$priority" "$NC" "$rc" "$risk" "$NC" "$dim" "$name" "$NC"
+    done
+  '
   set -e  # Re-enable errexit
 
   echo -e "${BOLD}╚═════════════════════════════════════════════════════════════╝${NC}"
@@ -697,6 +789,7 @@ cmd_status() {
   [[ $total -gt 0 ]] && pct=$((complete * 100 / total))
   echo -e "Progress: ${GREEN}$complete${NC}/$total (${pct}%)"
   [[ $blocked_count -gt 0 ]] && echo -e "Blocked: ${RED}$blocked_count${NC} spec(s)"
+  [[ -n "$next_spec_name" ]] && echo -e "Next: ${CYAN}$next_spec_name${NC}"
   echo -e "Quality: ${CYAN}$QUALITY_TIER${NC}"
 }
 
@@ -705,12 +798,13 @@ cmd_status() {
 # =============================================================================
 
 cmd_run() {
-  local iterations="" DRY_RUN=false
+  local iterations="" DRY_RUN=false VERBOSE=false
 
   while [[ $# -gt 0 ]]; do
     case $1 in
       --dry-run) DRY_RUN=true; shift ;;
-      -h|--help) echo "Usage: baldrick run [n] [--dry-run]"; exit 0 ;;
+      --verbose|-v) VERBOSE=true; shift ;;
+      -h|--help) echo "Usage: baldrick run [n] [--dry-run] [--verbose|-v]"; exit 0 ;;
       *)
         if [[ "$1" =~ ^[0-9]+$ ]]; then iterations="$1"
         else echo -e "${RED}Invalid:${NC} $1"; exit 1
@@ -768,7 +862,7 @@ cmd_run() {
     notify_completion "complete" "$COMPLETED" "$elapsed_str"
   }
 
-  trap 'stop_spinner; echo ""; echo -e "${YELLOW}Interrupted${NC}"; rm -f "$DONE_FILE"; show_summary; exit 130' INT
+  trap 'stop_spinner; echo ""; echo -e "${YELLOW}Interrupted${NC}"; log_activity "Interrupted after $COMPLETED iterations"; rm -f "$DONE_FILE"; show_summary; exit 130' INT
 
   echo ""
   echo -e "${BOLD}╔════════════════════════════════════════╗${NC}"
@@ -777,6 +871,7 @@ cmd_run() {
   echo -e "║ Iterations: ${CYAN}$iterations${NC}"
   echo -e "║ Quality:    ${CYAN}$QUALITY_TIER${NC}"
   [[ "$DRY_RUN" == true ]] && echo -e "║ Mode:       ${YELLOW}DRY RUN${NC}"
+  [[ "$VERBOSE" == true ]] && echo -e "║ Output:     ${CYAN}STREAMING${NC}"
   echo -e "${BOLD}╚════════════════════════════════════════╝${NC}"
   echo ""
 
@@ -785,6 +880,8 @@ cmd_run() {
     echo -e "Would run ${CYAN}$iterations${NC} iterations."
     exit 0
   fi
+
+  log_activity "Starting run: $iterations iterations (quality: $QUALITY_TIER)"
 
   local QUALITY
   QUALITY=$(get_quality_instructions)
@@ -843,6 +940,8 @@ Before implementing, REVIEW:
     echo -e "Spec: ${CYAN}$NEXT_SPEC_NAME${NC}"
     echo "════════════════════════════════════════"
 
+    log_activity "Iteration $i/$iterations started: $NEXT_SPEC_NAME [$ROLE]"
+
     local HASH
     HASH=$(get_state_hash)
     if [[ "$HASH" == "$LAST_HASH" ]] && [[ -n "$LAST_HASH" ]]; then
@@ -883,7 +982,23 @@ $STUCK_WARN
 
 $CONTEXT @${PROGRESS_FILE} $LEARNINGS @${PROMPT_FILE}"
 
-    run_claude "$PROMPT" "$LOG_FILE" || { echo "Claude failed"; show_summary; exit 1; }
+    run_claude "$PROMPT" "$LOG_FILE" "$VERBOSE"
+    local claude_exit=$?
+
+    # Handle non-zero exit (including timeout 124)
+    if [[ $claude_exit -ne 0 ]]; then
+      # Check if spec was completed despite exit code
+      if spec_passes "$NEXT_SPEC"; then
+        echo -e "${YELLOW}⚠${NC} Claude exited ($claude_exit) but spec completed successfully"
+        log_activity "$NEXT_SPEC_NAME completed (despite exit $claude_exit)"
+      else
+        echo -e "${RED}✗${NC} Claude failed (exit $claude_exit)"
+        log_activity "ERROR: $NEXT_SPEC_NAME failed (exit $claude_exit) - Iteration $i"
+        show_summary
+        exit 1
+      fi
+    fi
+
     COMPLETED=$i
 
     # Redundant completion check: all three signals must agree
@@ -908,6 +1023,7 @@ $CONTEXT @${PROGRESS_FILE} $LEARNINGS @${PROMPT_FILE}"
        [[ "$has_done_file" == "true" ]] && \
        [[ "$has_complete_token" == "true" ]]; then
       echo -e "${GREEN}All specs complete!${NC} (verified: file + token + all passes)"
+      log_activity "All specs complete after $i iterations"
       rm -f "$DONE_FILE"
       show_summary
       exit 0
@@ -945,6 +1061,7 @@ EOF
   done
 
   echo "Completed $iterations iterations"
+  log_activity "Completed $iterations iterations"
   rm -f "$DONE_FILE"
   show_summary
 }
@@ -954,12 +1071,13 @@ EOF
 # =============================================================================
 
 cmd_once() {
-  local spec_name="" max_iterations=30
+  local spec_name="" max_iterations=30 VERBOSE=false
 
   while [[ $# -gt 0 ]]; do
     case $1 in
       --max) max_iterations="$2"; shift 2 ;;
-      -h|--help) echo "Usage: baldrick once <spec-name> [--max n]"; exit 0 ;;
+      --verbose|-v) VERBOSE=true; shift ;;
+      -h|--help) echo "Usage: baldrick once <spec-name> [--max n] [--verbose|-v]"; exit 0 ;;
       *) [[ -z "$spec_name" ]] && spec_name="$1"; shift ;;
     esac
   done
@@ -992,9 +1110,12 @@ cmd_once() {
   echo ""
   echo -e "${BOLD}baldrick once: $spec_name${NC}"
   echo -e "Max iterations: ${CYAN}$max_iterations${NC}"
+  [[ "$VERBOSE" == true ]] && echo -e "Output:         ${CYAN}STREAMING${NC}"
   echo ""
 
-  trap 'stop_spinner; echo "Interrupted after $COMPLETED iterations"; rm -f "$DONE_FILE"; exit 130' INT
+  trap 'stop_spinner; echo "Interrupted after $COMPLETED iterations"; log_activity "Interrupted $spec_name after $COMPLETED iterations"; rm -f "$DONE_FILE"; exit 130' INT
+
+  log_activity "Starting focused work on $spec_name (max: $max_iterations iterations)"
 
   local LEARNINGS=""
   [[ -f "$LEARNINGS_FILE" ]] && LEARNINGS="@${LEARNINGS_FILE}"
@@ -1016,6 +1137,7 @@ Before continuing, REVIEW:
     fi
 
     echo "[$spec_name] Iteration $i/$max_iterations [$ROLE]"
+    log_activity "[$spec_name] Iteration $i started [$ROLE]"
 
     local HASH
     HASH=$(get_spec_hash)
@@ -1053,11 +1175,26 @@ Work ONLY on this spec: $spec_name
 
 @${spec_file} @${PROGRESS_FILE} $LEARNINGS @${PROMPT_FILE}"
 
-    run_claude "$PROMPT" "$LOG_FILE" || { echo "Claude failed"; exit 1; }
+    run_claude "$PROMPT" "$LOG_FILE" "$VERBOSE"
+    local claude_exit=$?
+
+    # Handle non-zero exit (including timeout 124)
+    if [[ $claude_exit -ne 0 ]]; then
+      if spec_passes "$spec_file"; then
+        echo -e "${YELLOW}⚠${NC} Claude exited ($claude_exit) but spec completed successfully"
+        log_activity "$spec_name completed (despite exit $claude_exit)"
+      else
+        echo -e "${RED}✗${NC} Claude failed (exit $claude_exit)"
+        log_activity "ERROR: $spec_name failed (exit $claude_exit) - Iteration $i"
+        exit 1
+      fi
+    fi
+
     COMPLETED=$i
 
     if [[ -f "$DONE_FILE" ]] || [[ "$CLAUDE_RESULT" == *"<promise>COMPLETE</promise>"* ]]; then
       echo -e "${GREEN}Complete: $spec_name${NC}"
+      log_activity "$spec_name completed after $i iterations"
       rm -f "$DONE_FILE"
       exit 0
     fi
@@ -1469,6 +1606,28 @@ cmd_validate() {
       ((spec_warnings++))
     fi
 
+    # Validate depends_on references exist
+    local depends_on
+    depends_on=$(extract_field "$spec" "depends_on")
+    if [[ -n "$depends_on" ]]; then
+      # Clean YAML array syntax
+      depends_on="${depends_on#[}"
+      depends_on="${depends_on%]}"
+      depends_on="${depends_on//\"/}"
+      depends_on="${depends_on//\'/}"
+
+      local dep_id
+      for dep_id in ${depends_on//,/ }; do
+        dep_id="${dep_id// /}"
+        [[ -z "$dep_id" ]] && continue
+
+        if ! find_spec_by_id "$dep_id" >/dev/null 2>&1; then
+          [[ "$quiet" != true ]] && echo -e "  ${RED}✗${NC} $name: depends_on references unknown ID '$dep_id'"
+          ((spec_errors++))
+        fi
+      done
+    fi
+
     if [[ $spec_errors -eq 0 ]]; then
       if [[ "$quiet" != true ]]; then
         if [[ $spec_warnings -gt 0 ]]; then
@@ -1519,6 +1678,9 @@ cmd_doctor() {
     echo "  Install: https://docs.anthropic.com/claude-code"
     ((errors++))
   fi
+
+  # Show detected project type
+  echo -e "${GREEN}✓${NC} Project type: ${CYAN}$DETECTED_PROJECT_TYPE${NC}"
 
   # Check build/test/lint commands
   [[ -n "$BUILD_CMD" ]] && echo -e "${GREEN}✓${NC} BUILD_CMD: $BUILD_CMD" || { echo -e "${YELLOW}⚠${NC} BUILD_CMD not set"; ((warnings++)); }
@@ -1592,6 +1754,199 @@ cmd_doctor() {
   fi
 }
 
+# =============================================================================
+# COMMAND: new (quick spec creation)
+# =============================================================================
+
+cmd_new() {
+  local name="" title="" priority="medium" depends=""
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -h|--help)
+        echo "Usage: baldrick new <spec-name> [--title \"Title\"] [--priority high|medium|low] [--depends id1,id2]"
+        exit 0
+        ;;
+      --title) title="$2"; shift 2 ;;
+      --priority) priority="$2"; shift 2 ;;
+      --depends) depends="$2"; shift 2 ;;
+      *) [[ -z "$name" ]] && name="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && { echo "Usage: baldrick new <spec-name>"; exit 1; }
+
+  # Clean name (remove .md if provided)
+  name="${name%.md}"
+
+  local spec_file="$SPECS_DIR/${name}.md"
+  [[ -f "$spec_file" ]] && { echo -e "${RED}Spec already exists:${NC} $spec_file"; exit 1; }
+
+  mkdir -p "$SPECS_DIR"
+
+  # Generate defaults
+  local id="${name}-v1"
+  local created=$(date +%Y-%m-%d)
+  [[ -z "$title" ]] && title="$name"
+
+  # Validate priority
+  if [[ ! "$priority" =~ ^(high|medium|low)$ ]]; then
+    echo -e "${YELLOW}Invalid priority '$priority', using 'medium'${NC}"
+    priority="medium"
+  fi
+
+  # Write spec file
+  cat > "$spec_file" << EOF
+---
+id: $id
+title: "$title"
+passes: false
+priority: $priority
+created: $created
+depends_on: [${depends}]
+---
+
+# $title
+
+> **One-liner:** [Brief description of what this does]
+
+## Context
+
+**User:** [Who uses this?]
+**Trigger:** [What kicks this off?]
+**Success:** [What does "working" look like?]
+
+## Scenarios
+
+### Scenario: Happy path
+\`\`\`gherkin
+Given [precondition]
+When [action]
+Then [expected result]
+\`\`\`
+
+## Done When
+
+- [ ] [Specific criterion 1]
+- [ ] [Specific criterion 2]
+- [ ] Build passes
+- [ ] Tests pass
+EOF
+
+  echo -e "${GREEN}✓${NC} Created: $spec_file"
+  echo ""
+  echo "Edit the file to add details, then run: baldrick validate"
+}
+
+# =============================================================================
+# COMMAND: logs (view/tail logs)
+# =============================================================================
+
+cmd_logs() {
+  local action="${1:-show}"
+  mkdir -p "$LOG_DIR"
+
+  case "$action" in
+    tail|-f)
+      local latest
+      latest=$(ls -t "$LOG_DIR"/baldrick-*.log 2>/dev/null | head -1)
+      [[ -z "$latest" ]] && { echo "No logs found in $LOG_DIR"; exit 1; }
+      echo -e "${DIM}Tailing: $latest${NC}"
+      echo -e "${DIM}Press Ctrl+C to stop${NC}"
+      echo ""
+      tail -f "$latest"
+      ;;
+    show|"")
+      local latest
+      latest=$(ls -t "$LOG_DIR"/baldrick-*.log 2>/dev/null | head -1)
+      [[ -z "$latest" ]] && { echo "No logs found in $LOG_DIR"; exit 1; }
+      echo -e "${BOLD}=== $(basename "$latest") ===${NC}"
+      cat "$latest"
+      ;;
+    list|ls)
+      echo -e "${BOLD}Logs in $LOG_DIR:${NC}"
+      ls -lh "$LOG_DIR"/*.log 2>/dev/null || echo "No logs found"
+      ;;
+    activity|audit)
+      if [[ ! -f "$ACTIVITY_LOG" ]]; then
+        echo "No activity log yet. Run 'baldrick run' to generate activity."
+        exit 0
+      fi
+      echo -e "${BOLD}=== Activity Log ===${NC}"
+      if [[ "$2" == "tail" ]] || [[ "$2" == "-f" ]]; then
+        tail -f "$ACTIVITY_LOG"
+      else
+        cat "$ACTIVITY_LOG"
+      fi
+      ;;
+    clean|clear)
+      local count
+      count=$(ls -1 "$LOG_DIR"/*.log 2>/dev/null | wc -l | tr -d ' ')
+      rm -f "$LOG_DIR"/*.log "$LOG_DIR"/iter-*.json 2>/dev/null
+      echo -e "${GREEN}✓${NC} Cleaned $count log file(s)"
+      ;;
+    -h|--help|help)
+      echo "Usage: baldrick logs [show|tail|list|activity|clean]"
+      echo ""
+      echo "Commands:"
+      echo "  show      Show latest Claude output log (default)"
+      echo "  tail      Follow latest log in real-time"
+      echo "  list      List all log files"
+      echo "  activity  Show activity audit trail"
+      echo "  clean     Remove all log files"
+      ;;
+    *)
+      echo "Unknown: $action"
+      echo "Usage: baldrick logs [show|tail|list|activity|clean]"
+      exit 1
+      ;;
+  esac
+}
+
+# =============================================================================
+# COMMAND: skip/unskip (temporarily block specs)
+# =============================================================================
+
+cmd_skip() {
+  local name="$1"
+  [[ -z "$name" ]] && { echo "Usage: baldrick skip <spec-name>"; exit 1; }
+
+  # Clean name
+  name="${name%.md}"
+  local spec_file="$SPECS_DIR/${name}.md"
+  [[ ! -f "$spec_file" ]] && { echo -e "${RED}Not found:${NC} $spec_file"; exit 1; }
+
+  # Check if already has blocked_by
+  if grep -q "^blocked_by:" "$spec_file"; then
+    sed -i '' 's/^blocked_by:.*/blocked_by: manual/' "$spec_file"
+  else
+    # Insert blocked_by after passes line
+    sed -i '' '/^passes:/a\
+blocked_by: manual
+' "$spec_file"
+  fi
+
+  echo -e "${YELLOW}⏭${NC} Skipped: $name"
+  echo "  Spec will be excluded from selection until unskipped"
+}
+
+cmd_unskip() {
+  local name="$1"
+  [[ -z "$name" ]] && { echo "Usage: baldrick unskip <spec-name>"; exit 1; }
+
+  # Clean name
+  name="${name%.md}"
+  local spec_file="$SPECS_DIR/${name}.md"
+  [[ ! -f "$spec_file" ]] && { echo -e "${RED}Not found:${NC} $spec_file"; exit 1; }
+
+  # Remove blocked_by line
+  if grep -q "^blocked_by:" "$spec_file"; then
+    sed -i '' '/^blocked_by:/d' "$spec_file"
+    echo -e "${GREEN}✓${NC} Unskipped: $name"
+  else
+    echo "$name is not currently skipped"
+  fi
+}
 
 # =============================================================================
 # MAIN DISPATCHER
@@ -1614,6 +1969,10 @@ main() {
     init)          cmd_init ;;
     archive)       cmd_archive "$@" ;;
     doctor)        cmd_doctor ;;
+    new|n)         cmd_new "$@" ;;
+    logs|l)        cmd_logs "$@" ;;
+    skip)          cmd_skip "$@" ;;
+    unskip)        cmd_unskip "$@" ;;
 
     # Meta
     help|-h|--help) cmd_help ;;
@@ -1634,5 +1993,6 @@ main() {
 # =============================================================================
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  detect_project_type
   main "$@"
 fi
