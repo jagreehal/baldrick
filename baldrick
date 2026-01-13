@@ -50,6 +50,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Activity logging
 : "${ACTIVITY_LOG:=$LOG_DIR/activity.log}"
 
+# TUI integration (optional - enables real-time event streaming)
+: "${BALDRICK_STREAM_FIFO:=}"   # Path to FIFO for event streaming
+: "${BALDRICK_CONTROL_SOCK:=}" # Path to Unix socket for control commands
+PAUSE_FILE=""                   # Set during run to enable pause/resume
+STOP_FILE=""                    # Set during run to enable graceful stop
+
 # =============================================================================
 # EMBEDDED AGENT INSTRUCTIONS (no external baldrick-prompt.md needed)
 # =============================================================================
@@ -276,6 +282,107 @@ log_activity() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" >> "$ACTIVITY_LOG"
 }
 
+# =============================================================================
+# TUI EVENT STREAMING (real-time updates to TUI via FIFO)
+# =============================================================================
+
+# Emit JSON event to TUI via FIFO (no-op if FIFO not configured)
+# Usage: emit_event "type" '"key":"value","key2":"value2"'
+emit_event() {
+  local type="$1" payload="$2"
+  # Only emit if FIFO is configured and exists as a named pipe
+  if [[ -n "$BALDRICK_STREAM_FIFO" ]] && [[ -p "$BALDRICK_STREAM_FIFO" ]]; then
+    local ts
+    ts=$(date -Iseconds)
+    # Use timeout to avoid blocking if TUI disconnects
+    timeout 1 bash -c "printf '%s\n' '{\"type\":\"$type\",\"ts\":\"$ts\",$payload}' > \"$BALDRICK_STREAM_FIFO\"" 2>/dev/null || true
+  fi
+}
+
+# Check for pause/stop signals from TUI control socket
+check_control_signals() {
+  # Check for stop signal
+  if [[ -n "$STOP_FILE" ]] && [[ -f "$STOP_FILE" ]]; then
+    rm -f "$STOP_FILE"
+    emit_event "status" '"state":"stopped"'
+    return 1  # Signal caller to stop
+  fi
+
+  # Check for pause signal and wait until resumed
+  if [[ -n "$PAUSE_FILE" ]] && [[ -f "$PAUSE_FILE" ]]; then
+    emit_event "status" '"state":"paused"'
+    echo -e "${YELLOW}⏸ Paused${NC} (waiting for resume signal...)"
+    while [[ -f "$PAUSE_FILE" ]]; do
+      # Check for stop while paused
+      if [[ -n "$STOP_FILE" ]] && [[ -f "$STOP_FILE" ]]; then
+        rm -f "$STOP_FILE" "$PAUSE_FILE"
+        emit_event "status" '"state":"stopped"'
+        return 1
+      fi
+      sleep 1
+    done
+    emit_event "status" '"state":"resumed"'
+    echo -e "${GREEN}▶ Resumed${NC}"
+  fi
+
+  return 0  # Continue normally
+}
+
+# Start control socket listener (background process)
+start_control_listener() {
+  [[ -z "$BALDRICK_CONTROL_SOCK" ]] && return
+
+  # Create temp files for pause/stop signals
+  PAUSE_FILE="/tmp/baldrick-$$.pause"
+  STOP_FILE="/tmp/baldrick-$$.stop"
+  rm -f "$PAUSE_FILE" "$STOP_FILE"
+
+  # Remove old socket if exists
+  rm -f "$BALDRICK_CONTROL_SOCK"
+
+  # Start listener using netcat (macOS compatible)
+  (
+    while true; do
+      # Listen for single command, then loop
+      if command -v nc >/dev/null 2>&1; then
+        cmd=$(nc -lU "$BALDRICK_CONTROL_SOCK" 2>/dev/null | head -1)
+      else
+        # Fallback: check for socat
+        if command -v socat >/dev/null 2>&1; then
+          cmd=$(socat -u UNIX-LISTEN:"$BALDRICK_CONTROL_SOCK" - 2>/dev/null | head -1)
+        else
+          break  # No socket tool available
+        fi
+      fi
+
+      case "$cmd" in
+        pause)
+          touch "$PAUSE_FILE"
+          ;;
+        resume)
+          rm -f "$PAUSE_FILE"
+          ;;
+        stop)
+          touch "$STOP_FILE"
+          break
+          ;;
+        skip-current)
+          # Will be handled by main loop checking a skip file
+          touch "/tmp/baldrick-$$.skip"
+          ;;
+      esac
+    done
+  ) &
+  CONTROL_PID=$!
+  disown $CONTROL_PID 2>/dev/null
+}
+
+# Stop control listener and clean up
+stop_control_listener() {
+  [[ -n "$CONTROL_PID" ]] && kill $CONTROL_PID 2>/dev/null
+  rm -f "$BALDRICK_CONTROL_SOCK" "$PAUSE_FILE" "$STOP_FILE" "/tmp/baldrick-$$.skip" 2>/dev/null
+  CONTROL_PID=""
+}
 
 # =============================================================================
 # PURE UTILITY FUNCTIONS (no side effects, testable in isolation)
@@ -627,6 +734,7 @@ ${CYAN}Usage:${NC} baldrick <command> [options]
 ${CYAN}Execution:${NC}
   run [n] [--dry-run]     Run n iterations (default: 10)
   once <spec> [--max n]   Focus on single spec until done
+  tui                     Launch interactive TUI (requires baldrick-tui)
 
 ${CYAN}Status:${NC}
   status                  Show specs and progress
@@ -804,7 +912,9 @@ cmd_run() {
     case $1 in
       --dry-run) DRY_RUN=true; shift ;;
       --verbose|-v) VERBOSE=true; shift ;;
-      -h|--help) echo "Usage: baldrick run [n] [--dry-run] [--verbose|-v]"; exit 0 ;;
+      --stream=*) BALDRICK_STREAM_FIFO="${1#*=}"; shift ;;
+      --control=*) BALDRICK_CONTROL_SOCK="${1#*=}"; shift ;;
+      -h|--help) echo "Usage: baldrick run [n] [--dry-run] [--verbose|-v] [--stream=PATH] [--control=PATH]"; exit 0 ;;
       *)
         if [[ "$1" =~ ^[0-9]+$ ]]; then iterations="$1"
         else echo -e "${RED}Invalid:${NC} $1"; exit 1
@@ -883,10 +993,24 @@ cmd_run() {
 
   log_activity "Starting run: $iterations iterations (quality: $QUALITY_TIER)"
 
+  # Start TUI control listener if control socket specified
+  start_control_listener
+  trap 'stop_spinner; stop_control_listener; echo ""; echo -e "${YELLOW}Interrupted${NC}"; log_activity "Interrupted after $COMPLETED iterations"; rm -f "$DONE_FILE"; emit_event "status" "\"state\":\"interrupted\",\"completed\":$COMPLETED"; show_summary; exit 130' INT
+
+  # Emit run start event for TUI
+  emit_event "run:start" "\"iterations\":$iterations,\"quality\":\"$QUALITY_TIER\""
+
   local QUALITY
   QUALITY=$(get_quality_instructions)
 
   for ((i=1; i<=iterations; i++)); do
+    # Check for pause/stop signals from TUI
+    if ! check_control_signals; then
+      log_activity "Stopped by user after $COMPLETED iterations"
+      show_summary
+      stop_control_listener
+      exit 0
+    fi
     # Deterministic spec selection (core decides, not Claude)
     local NEXT_SPEC
     NEXT_SPEC=$(get_next_spec)
@@ -942,11 +1066,17 @@ Before implementing, REVIEW:
 
     log_activity "Iteration $i/$iterations started: $NEXT_SPEC_NAME [$ROLE]"
 
+    # Emit iteration start event for TUI
+    emit_event "iteration:start" "\"iteration\":$i,\"total\":$iterations,\"spec\":\"$NEXT_SPEC_NAME\",\"mode\":\"$ROLE\""
+
     local HASH
     HASH=$(get_state_hash)
     if [[ "$HASH" == "$LAST_HASH" ]] && [[ -n "$LAST_HASH" ]]; then
       ((STUCK++))
-      [[ $STUCK -ge 2 ]] && echo -e "${YELLOW}⚠ Stuck for $STUCK iterations${NC}"
+      if [[ $STUCK -ge 2 ]]; then
+        echo -e "${YELLOW}⚠ Stuck for $STUCK iterations${NC}"
+        emit_event "stuck:detected" "\"count\":$STUCK,\"spec\":\"$NEXT_SPEC_NAME\""
+      fi
     else
       STUCK=0
       LAST_HASH="$HASH"
@@ -982,8 +1112,13 @@ $STUCK_WARN
 
 $CONTEXT @${PROGRESS_FILE} $LEARNINGS @${PROMPT_FILE}"
 
+    local iter_start_time
+    iter_start_time=$(date +%s)
+
     run_claude "$PROMPT" "$LOG_FILE" "$VERBOSE"
     local claude_exit=$?
+
+    local iter_duration=$(( $(date +%s) - iter_start_time ))
 
     # Handle non-zero exit (including timeout 124)
     if [[ $claude_exit -ne 0 ]]; then
@@ -1000,6 +1135,16 @@ $CONTEXT @${PROGRESS_FILE} $LEARNINGS @${PROMPT_FILE}"
     fi
 
     COMPLETED=$i
+
+    # Check if this spec passed (for event)
+    local spec_passed=false
+    spec_passes "$NEXT_SPEC" && spec_passed=true
+
+    # Emit iteration end event for TUI
+    emit_event "iteration:end" "\"iteration\":$i,\"duration\":$iter_duration,\"exitCode\":$claude_exit,\"specPassed\":$spec_passed,\"spec\":\"$NEXT_SPEC_NAME\""
+
+    # Emit spec change event if spec passed
+    [[ "$spec_passed" == "true" ]] && emit_event "spec:change" "\"spec\":\"$NEXT_SPEC_NAME\",\"passes\":true"
 
     # Redundant completion check: all three signals must agree
     local all_specs_pass=true
@@ -1024,7 +1169,9 @@ $CONTEXT @${PROGRESS_FILE} $LEARNINGS @${PROMPT_FILE}"
        [[ "$has_complete_token" == "true" ]]; then
       echo -e "${GREEN}All specs complete!${NC} (verified: file + token + all passes)"
       log_activity "All specs complete after $i iterations"
+      emit_event "complete" "\"status\":\"success\",\"iterations\":$i"
       rm -f "$DONE_FILE"
+      stop_control_listener
       show_summary
       exit 0
     fi
@@ -1062,7 +1209,9 @@ EOF
 
   echo "Completed $iterations iterations"
   log_activity "Completed $iterations iterations"
+  emit_event "complete" "\"status\":\"max_iterations\",\"iterations\":$iterations"
   rm -f "$DONE_FILE"
+  stop_control_listener
   show_summary
 }
 
@@ -1949,6 +2098,37 @@ cmd_unskip() {
 }
 
 # =============================================================================
+# COMMAND: tui (launch TUI with integration)
+# =============================================================================
+
+cmd_tui() {
+  # Check if baldrick-tui is available
+  if ! command -v baldrick-tui >/dev/null 2>&1; then
+    # Check common locations
+    local tui_path=""
+    for path in "../baldrick-tui/dist/baldrick-tui" "./baldrick-tui" "baldrick-tui"; do
+      if [[ -x "$path" ]]; then
+        tui_path="$path"
+        break
+      fi
+    done
+
+    if [[ -z "$tui_path" ]]; then
+      echo -e "${RED}baldrick-tui not found.${NC}"
+      echo ""
+      echo "Install baldrick-tui or ensure it's in PATH."
+      echo "See: https://github.com/your/baldrick-tui"
+      exit 1
+    fi
+  else
+    tui_path="baldrick-tui"
+  fi
+
+  echo -e "${CYAN}Launching TUI...${NC}"
+  exec "$tui_path" --project="$PROJECT_DIR"
+}
+
+# =============================================================================
 # MAIN DISPATCHER
 # =============================================================================
 
@@ -1960,6 +2140,7 @@ main() {
     # Execution
     run|r)         cmd_run "$@" ;;
     once)          cmd_once "$@" ;;
+    tui)           cmd_tui ;;
 
     # Status
     status|s|list) cmd_status ;;
