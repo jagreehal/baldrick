@@ -101,6 +101,22 @@ That's it. Claude implements the feature, runs quality gates (build/test/lint), 
 
 ---
 
+## For Non-Technical Users
+
+Don't want to write specs manually? Use any AI assistant (ChatGPT, Gemini, Claude):
+
+1. **Chat about your feature** - Describe what you want to build
+2. **Paste the generator template** - Copy [`templates/spec-generator.md`](templates/spec-generator.md) into your chat
+3. **Get a Baldrick spec** - The AI generates a properly formatted spec
+4. **Save to specs folder** - Copy output to `specs/your-feature.md` (Baldrick auto-discovers specs here)
+5. **Run Baldrick** - `./baldrick run` or `./baldrick once your-feature` to run a specific spec
+
+This bridges conversational AI (great for brainstorming) with Baldrick (great for execution).
+
+**Tip:** If your feature is large, the AI will generate multiple specs. Save each one as a separate file.
+
+---
+
 ## The Development Cycle
 
 ```
@@ -176,6 +192,7 @@ Don't want to start from scratch? Download a template:
 | **Standard** | Adds context, examples, scenarios | [View](templates/standard.md) |
 | **Detailed** | Full spec with diagrams, dependencies | [View](templates/detailed.md) |
 | **Example** | Filled-in spec (task priority feature) | [View](templates/example.md) |
+| **Spec Generator** | Paste into ChatGPT/Gemini to generate specs | [View](templates/spec-generator.md) |
 
 Or run `./baldrick init` to create templates locally in `templates/`.
 
