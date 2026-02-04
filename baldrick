@@ -56,6 +56,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PAUSE_FILE=""                   # Set during run to enable pause/resume
 STOP_FILE=""                    # Set during run to enable graceful stop
 
+# Previous commits in prompt (0 = disabled; e.g. 10 to show last 10 commits)
+: "${BALDRICK_COMMIT_CONTEXT:=0}"
+# Optional: grep pattern for commit messages (e.g. "feat:" or "RALPH:")
+: "${BALDRICK_COMMIT_GREP:=}"
+
+# Optional: paths to remove before run (space-separated; under PROJECT_DIR only)
+: "${BALDRICK_CLEANUP_PATHS:=}"
+
+# Optional: use Claude --output-format stream-json and jq to stream + parse (requires jq)
+: "${BALDRICK_STREAM_JSON:=}"
+
 # =============================================================================
 # EMBEDDED AGENT INSTRUCTIONS (no external baldrick-prompt.md needed)
 # =============================================================================
@@ -74,20 +85,29 @@ Look for `## SELECTED SPEC` in the context - implement that one.
 1. Read `## Codebase Patterns` at TOP of `progress.txt` FIRST
 2. Read `baldrick-learnings.md` for permanent patterns
 3. Find the **SELECTED SPEC** section in the context (this is your target)
-4. Implement that single spec following BDD scenarios
-5. Run quality checks (see Configuration section below)
-6. If checks pass, commit ALL changes
-7. Update the spec to set `passes: true`
-8. Append progress to `progress.txt`
+4. Explore the repo as needed to implement the selected spec (read relevant files, fill context).
+5. Implement that single spec following BDD scenarios
+6. Run quality checks (see Configuration and Before committing below)
+7. If checks pass, commit ALL changes
+8. Update the spec to set `passes: true`
+9. Append progress to `progress.txt`
 
 **Important:** Do NOT pick a different spec. The core loop has already selected the correct one based on priority and dependency ordering.
 
 ## Quality Requirements
 
 **CRITICAL**: ALL commits must pass quality checks.
-Run the build, test, and lint commands from the Configuration section.
 Do NOT set `passes: true` until ALL checks pass.
 PASTE the actual command output in your progress notes.
+
+## Before committing
+
+Run these in order (see Configuration for the actual commands):
+1. Run the build command
+2. Run the test command
+3. Run the lint command
+Only commit if all three succeed.
+For web apps, you may also run the dev server and use Playwright MCP to verify the feature.
 
 ## Progress Report Format
 
@@ -136,12 +156,15 @@ Create `tradeoffs.md` if it doesn't exist. This file answers "why was it done th
 
 ## Commit Message Format
 
-Use conventional commits:
+Use conventional commits. Title: feat: [Spec Name] - Brief description.
+Optional body for traceability:
 ```
 feat: [Spec Name] - Brief description
 
-- Key change 1
-- Key change 2
+Spec: [spec id from frontmatter]
+Key changes: [what you did]
+Files changed: [list or summary]
+Blockers/notes: [any blockers for next iteration or "None"]
 ```
 
 ## Stop Condition
@@ -162,11 +185,12 @@ If you cannot make progress:
 - Read errors carefully, fix root cause
 
 If truly blocked after multiple attempts:
-- Output: `<promise>BLOCKED</promise>` with explanation
+- Output: `<promise>BLOCKED</promise>` with a short reason.
 
 ## Important Rules
 
 - Work on **ONE spec per iteration**
+- Within a spec, prefer one scenario or one Done-When item at a time when the spec is large.
 - Commit frequently
 - Keep all checks passing
 - Read Codebase Patterns FIRST before implementing
@@ -581,6 +605,43 @@ Maintainable code. Full test coverage. Handle errors properly. No shortcuts."
   esac
 }
 
+# Safe cleanup of paths under PROJECT_DIR (BALDRICK_CLEANUP_PATHS space-separated)
+run_cleanup_paths() {
+  [[ -z "${BALDRICK_CLEANUP_PATHS:-}" ]] && return 0
+  local project_canon
+  project_canon=$(cd "$PROJECT_DIR" && pwd -P 2>/dev/null) || project_canon="$PROJECT_DIR"
+  local path
+  for path in $BALDRICK_CLEANUP_PATHS; do
+    path=$(echo "$path" | xargs)
+    [[ -z "$path" ]] && continue
+    local full
+    full=$(cd "$PROJECT_DIR" && cd "$path" 2>/dev/null && pwd -P 2>/dev/null) || continue
+    [[ "$full" == "$project_canon" ]] && continue
+    [[ "$full" != "$project_canon/"* ]] && continue
+    rm -rf "$full" 2>/dev/null || true
+  done
+}
+
+# Previous commits for prompt (recent work context)
+get_previous_commits_context() {
+  [[ "${BALDRICK_COMMIT_CONTEXT:-0}" -eq 0 ]] && return 0
+  local n="${BALDRICK_COMMIT_CONTEXT}"
+  local out
+  if [[ -n "${BALDRICK_COMMIT_GREP:-}" ]]; then
+    out=$(cd "$PROJECT_DIR" && git log --grep="$BALDRICK_COMMIT_GREP" -n "$n" --format="%h %ad %s%n%b---" --date=short 2>/dev/null) || out=""
+  else
+    out=$(cd "$PROJECT_DIR" && git log -n "$n" --format="%h %ad %s%n%b---" --date=short 2>/dev/null) || out=""
+  fi
+  if [[ -z "$out" ]]; then
+    echo "## Previous commits (recent work)
+No commits found."
+  else
+    echo "## Previous commits (recent work)
+
+$out"
+  fi
+}
+
 # =============================================================================
 # SESSION TRACKING
 # =============================================================================
@@ -690,6 +751,34 @@ run_claude() {
   local temp exit_code
   temp=$(mktemp)
 
+  # Optional: stream-json path (requires jq and Claude CLI --output-format stream-json)
+  if [[ -n "${BALDRICK_STREAM_JSON:-}" ]] && command -v jq >/dev/null 2>&1; then
+    local temp_json temp_txt
+    temp_json=$(mktemp)
+    temp_txt=$(mktemp)
+    # jq filter to extract streaming text from assistant messages (Ralph-style)
+    local jq_stream='select(.type == "assistant").message.content[]? | select(.type == "text").text // empty | gsub("\n"; "\r\n") | . + "\r\n\n"'
+    echo -e "${CYAN}─── Claude output (stream-json) ───────────────────────────${NC}"
+    timeout "$CLAUDE_TIMEOUT" $CLAUDE_RUNNER --permission-mode acceptEdits --output-format stream-json -p "$prompt" 2>&1 \
+      | grep --line-buffered '^{' \
+      | tee "$temp_json" \
+      | jq --unbuffered -r "$jq_stream" \
+      | tee "$temp_txt"
+    exit_code=${PIPESTATUS[0]}
+    echo -e "${CYAN}─── End output ──────────────────────────────────────────${NC}"
+    CLAUDE_RESULT=$(cat "$temp_txt")
+    [[ -n "$log_file" ]] && cat "$temp_txt" >> "$log_file"
+    local lines
+    lines=$(wc -l < "$temp_txt" | tr -d ' ')
+    echo -e "${GREEN}✓${NC} Claude responded ($lines lines)"
+    rm -f "$temp_json" "$temp_txt" "$temp"
+    CLAUDE_EXIT=$exit_code
+    if [[ $exit_code -eq 124 ]]; then
+      echo -e "${RED}✗${NC} Claude timed out after ${CLAUDE_TIMEOUT}s"
+    fi
+    return $exit_code
+  fi
+
   if [[ "$verbose" == "true" ]]; then
     # Verbose mode: stream output in real-time
     echo -e "${CYAN}─── Claude output ───────────────────────────────────────${NC}"
@@ -732,7 +821,7 @@ ${BOLD}baldrick v$VERSION${NC} - AI-assisted feature execution
 ${CYAN}Usage:${NC} baldrick <command> [options]
 
 ${CYAN}Execution:${NC}
-  run [n] [--dry-run]     Run n iterations (default: 10)
+  run [n] [--dry-run] [--stream-json]  Run n iterations (default: 10)
   once <spec> [--max n]   Focus on single spec until done
   tui                     Launch interactive TUI (requires baldrick-tui)
 
@@ -760,6 +849,10 @@ ${CYAN}Configuration (env vars):${NC}
   QUALITY_TIER    prototype | production | library
   REVIEW_EVERY    Reviewer mode cadence (default: 5)
   CLAUDE_TIMEOUT  Max seconds per Claude call (default: 300)
+  BALDRICK_COMMIT_CONTEXT  Last N commits in prompt (0=off, e.g. 10)
+  BALDRICK_COMMIT_GREP     Optional grep for commit messages (e.g. feat:)
+  BALDRICK_CLEANUP_PATHS   Space-separated paths to remove before run (under project)
+  BALDRICK_STREAM_JSON     Set to use Claude stream-json + jq (requires jq)
 
 ${CYAN}Spec Creation (use Claude Code skills):${NC}
   Load "spec-create" skill for interactive creation
@@ -912,9 +1005,10 @@ cmd_run() {
     case $1 in
       --dry-run) DRY_RUN=true; shift ;;
       --verbose|-v) VERBOSE=true; shift ;;
+      --stream-json) BALDRICK_STREAM_JSON=1; shift ;;
       --stream=*) BALDRICK_STREAM_FIFO="${1#*=}"; shift ;;
       --control=*) BALDRICK_CONTROL_SOCK="${1#*=}"; shift ;;
-      -h|--help) echo "Usage: baldrick run [n] [--dry-run] [--verbose|-v] [--stream=PATH] [--control=PATH]"; exit 0 ;;
+      -h|--help) echo "Usage: baldrick run [n] [--dry-run] [--verbose|-v] [--stream-json] [--stream=PATH] [--control=PATH]"; exit 0 ;;
       *)
         if [[ "$1" =~ ^[0-9]+$ ]]; then iterations="$1"
         else echo -e "${RED}Invalid:${NC} $1"; exit 1
@@ -992,6 +1086,8 @@ cmd_run() {
   fi
 
   log_activity "Starting run: $iterations iterations (quality: $QUALITY_TIER)"
+
+  run_cleanup_paths
 
   # Start TUI control listener if control socket specified
   start_control_listener
@@ -1095,6 +1191,9 @@ No progress for $STUCK iterations. Try DIFFERENT approach:
     local LEARNINGS=""
     [[ -f "$LEARNINGS_FILE" ]] && LEARNINGS="@${LEARNINGS_FILE}"
 
+    local PREV_COMMITS
+    PREV_COMMITS=$(get_previous_commits_context)
+
     # Dynamic configuration prepended to prompt
     local CONFIG="## Configuration
 - Build: ${BUILD_CMD}
@@ -1106,6 +1205,8 @@ No progress for $STUCK iterations. Try DIFFERENT approach:
 $QUALITY
 $ROLE_INST
 $STUCK_WARN
+
+$PREV_COMMITS
 "
 
     local PROMPT="$CONFIG
@@ -1266,6 +1367,8 @@ cmd_once() {
 
   log_activity "Starting focused work on $spec_name (max: $max_iterations iterations)"
 
+  run_cleanup_paths
+
   local LEARNINGS=""
   [[ -f "$LEARNINGS_FILE" ]] && LEARNINGS="@${LEARNINGS_FILE}"
   local QUALITY
@@ -1303,6 +1406,9 @@ Before continuing, REVIEW:
 ## ⚠ STUCK
 No progress for $STUCK iterations. Try DIFFERENT approach or output <promise>BLOCKED</promise> if truly stuck."
 
+    local PREV_COMMITS
+    PREV_COMMITS=$(get_previous_commits_context)
+
     # Dynamic configuration prepended to prompt
     local CONFIG="## Configuration
 - Build: ${BUILD_CMD}
@@ -1314,6 +1420,8 @@ No progress for $STUCK iterations. Try DIFFERENT approach or output <promise>BLO
 $QUALITY
 $ROLE_INST
 $STUCK_WARN
+
+$PREV_COMMITS
 
 ## Focus Mode
 Work ONLY on this spec: $spec_name
@@ -1845,6 +1953,11 @@ cmd_doctor() {
   else
     echo -e "${DIM}○${NC} NOTIFY_CMD not set (optional)"
   fi
+
+  echo -e "${GREEN}✓${NC} BALDRICK_COMMIT_CONTEXT: ${BALDRICK_COMMIT_CONTEXT:-0}"
+  [[ -n "${BALDRICK_COMMIT_GREP:-}" ]] && echo -e "${GREEN}✓${NC} BALDRICK_COMMIT_GREP: $BALDRICK_COMMIT_GREP" || echo -e "${DIM}○${NC} BALDRICK_COMMIT_GREP not set"
+  [[ -n "${BALDRICK_CLEANUP_PATHS:-}" ]] && echo -e "${GREEN}✓${NC} BALDRICK_CLEANUP_PATHS: $BALDRICK_CLEANUP_PATHS" || echo -e "${DIM}○${NC} BALDRICK_CLEANUP_PATHS not set"
+  [[ -n "${BALDRICK_STREAM_JSON:-}" ]] && ( command -v jq >/dev/null 2>&1 && echo -e "${GREEN}✓${NC} BALDRICK_STREAM_JSON: set (jq found)" || echo -e "${YELLOW}⚠${NC} BALDRICK_STREAM_JSON set but jq not found" ) || echo -e "${DIM}○${NC} BALDRICK_STREAM_JSON not set"
 
   # Check directories
   if [[ -d "$SPECS_DIR" ]]; then

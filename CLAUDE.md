@@ -10,8 +10,8 @@ The core loop **deterministically selects** the highest priority incomplete spec
 
 ```bash
 # Run the loop
-./baldrick run [n] [--dry-run]  # Run n iterations (default: 10)
-./baldrick once <spec> [--max n] # Focus on single spec until done
+./baldrick run [n] [--dry-run] [--stream-json] [--verbose|-v]  # Run n iterations (default: 10)
+./baldrick once <spec> [--max n] [--verbose|-v]  # Focus on single spec until done
 
 # Check status
 ./baldrick status               # Show specs and progress
@@ -20,9 +20,15 @@ The core loop **deterministically selects** the highest priority incomplete spec
 
 # Utilities
 ./baldrick init                 # Setup project structure
+./baldrick new <name>           # Create new spec interactively
 ./baldrick archive              # Archive current session
 ./baldrick archive list         # List archived sessions
-./baldrick archive restore <n>  # Restore archived session
+./baldrick archive restore <name>  # Restore archived session
+./baldrick logs [show|tail|list|activity|clean]  # View iteration logs
+./baldrick skip <spec>          # Temporarily skip a spec
+./baldrick unskip <spec>        # Re-enable a skipped spec
+./baldrick tui                  # Launch interactive TUI (requires baldrick-tui)
+./baldrick --version            # Show version
 ```
 
 ## Key Files
@@ -36,6 +42,7 @@ The core loop **deterministically selects** the highest priority incomplete spec
 | `tradeoffs.md` | Decision log (why choices were made) |
 | `logs/iter-*.json` | Structured iteration data |
 | `logs/baldrick-*.log` | Raw Claude output |
+| `logs/activity.log` | Activity audit trail |
 | `templates/example.md` | Example spec format |
 
 ## Spec Format v1 (Quick Reference)
@@ -64,6 +71,8 @@ depends_on: []             # Array of spec IDs
 **Selection order:** priority (high→low) → risk (spike→polish) → created (old→new) → id (A→Z)
 
 **Important:** `passes: true` means the spec's Done When criteria are met **and** quality gates (build/test/lint) are green.
+
+**Configuration (env):** BUILD_CMD, TEST_CMD, LINT_CMD; optional BALDRICK_COMMIT_CONTEXT, BALDRICK_CLEANUP_PATHS, BALDRICK_STREAM_JSON. See README or `./baldrick help`.
 
 ## Workflow Per Iteration
 

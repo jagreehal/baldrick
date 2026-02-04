@@ -15,28 +15,26 @@ Each iteration:
 
 1. Read `## Codebase Patterns` at top of progress.txt FIRST
 2. Read `baldrick-learnings.md` for additional patterns
-3. Read all specs in `specs/*.md` where `passes: false`
-4. Pick the HIGHEST PRIORITY incomplete spec
-5. Implement that single spec
-6. Run build, test, lint commands
-7. Update spec to `passes: true`
-8. Append progress with learnings
-9. Add reusable patterns to progress.txt and baldrick-learnings.md
-10. Commit changes
+3. Find `## SELECTED SPEC` in context (the loop has already selected it by priority → risk → created → id)
+4. Implement that single spec
+5. Run build, test, lint commands
+6. Update spec to `passes: true`
+7. Append progress with learnings
+8. Add reusable patterns to progress.txt and baldrick-learnings.md
+9. Commit changes
 
 ---
 
 ## Priority Order
 
-Specs are selected in this order:
+Specs are selected deterministically in this order:
 
 1. **Priority**: `high` > `medium` > `low`
-2. **Within same priority, Risk**: `spike` > `integration` > `standard` > `polish`
+2. **Risk**: `spike` > `integration` > `standard` > `polish`
+3. **Created**: older first (from `created:` frontmatter)
+4. **Id**: A→Z (tiebreaker)
 
-This ensures:
-- Critical work happens first
-- Unknowns (spikes) are resolved early
-- Polish happens last
+This ensures critical work first, unknowns (spikes) early, polish last.
 
 ---
 
@@ -111,9 +109,14 @@ Do NOT commit broken code.
 # Preview without executing
 ./baldrick run 5 --dry-run
 
+# Stream Claude output (or use stream-json + jq)
+./baldrick run 10 --verbose
+./baldrick run 10 --stream-json   # requires jq
+
 # Work on single spec until done
 ./baldrick once login-feature
 ./baldrick once login-feature --max 15
+./baldrick once login-feature --max 15 --verbose
 ```
 
 ---

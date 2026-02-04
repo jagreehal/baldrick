@@ -95,6 +95,7 @@ That's it. Claude implements the feature, runs quality gates (build/test/lint), 
 
 **Run options:**
 - `--dry-run` - Show what would run without executing
+- `--stream-json` - Use Claude stream-json + jq (requires jq)
 - `--verbose` or `-v` - Stream Claude output in real-time (instead of spinner)
 - `--stream=PATH` - Enable TUI event streaming (advanced)
 - `--control=PATH` - Enable TUI control socket (advanced)
@@ -157,7 +158,7 @@ Each iteration rebuilds context from files (specs + progress + learnings), not c
 
 ```bash
 # Execution
-./baldrick run [n] [--dry-run] [--verbose|-v]    # Run n iterations (default: 10)
+./baldrick run [n] [--dry-run] [--stream-json] [--verbose|-v]    # Run n iterations (default: 10)
 ./baldrick once <name> [--max n] [--verbose|-v]  # Focus on single spec until done
 ./baldrick tui                                  # Launch interactive TUI
 
@@ -211,6 +212,10 @@ Set these environment variables to customize baldrick:
 | `REVIEW_EVERY` | `5` | Reviewer mode every N iterations |
 | `CLAUDE_TIMEOUT` | `300` | Max seconds per Claude call (prevents hung loops) |
 | `NOTIFY_CMD` | (none) | Notification webhook |
+| `BALDRICK_COMMIT_CONTEXT` | `0` | Last N commits in prompt (e.g. 10); 0 = off |
+| `BALDRICK_COMMIT_GREP` | (none) | Optional grep for commit messages (e.g. `feat:`) |
+| `BALDRICK_CLEANUP_PATHS` | (none) | Space-separated paths to remove before run (under project) |
+| `BALDRICK_STREAM_JSON` | (none) | Set to use Claude stream-json + jq (requires jq) |
 
 **For non-Node projects**, set these before running:
 
